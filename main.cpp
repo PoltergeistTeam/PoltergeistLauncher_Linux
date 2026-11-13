@@ -1,5 +1,5 @@
 // PoltergeistLauncher — C++17, Linux port: GLFW + OpenGL3 + Dear ImGui + libcurl.
-// Vanilla / Fabric / Forge, Java auto-detect+download, offline / Ely.by / Microsoft,
+// Vanilla / Fabric / Forge / NeoForge / Quilt / OptiFine, Java auto-detect+download, offline / Ely.by / Microsoft,
 // custom backgrounds from screenshots, crash explainer.
 #include <unistd.h>
 #include <fcntl.h>
@@ -28,6 +28,8 @@
 #include <cstring>
 #include <cctype>
 #include <chrono>
+#include <tuple>
+#include <dlfcn.h>
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
@@ -43,7 +45,7 @@
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
-static const char* kVer = "0.0.4";
+static const char* kVer = "0.0.5";
 
 // ====== Настройка: Azure Client ID для входа через Microsoft (см. объяснение в ответе) ======
 static const std::string kMsClientId = ""; // можно оставить пустым: ID вводится в приложении (вкладка «Аккаунт») и сохраняется в config.json
@@ -315,6 +317,22 @@ static void FetchVersions() {
     gLatest = j["latest"].value("release", "");
     for (auto& v : j["versions"]) gVers.push_back({v.value("id", ""), v.value("type", ""), v.value("url", "")});
 }
+static std::vector<std::string> NeoVersions() { // версии NeoForge из maven-metadata.xml (по возрастанию)
+    std::vector<std::string> r; Resp x = Http("https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml");
+    if (x.status != 200) return r;
+    size_t p = 0;
+    while ((p = x.body.find("<version>", p)) != std::string::npos) {
+        size_t e = x.body.find("</version>", p); if (e == std::string::npos) break;
+        r.push_back(x.body.substr(p + 9, e - p - 9)); p = e;
+    }
+    return r;
+}
+static std::string NeoMcOf(const std::string& v) { // 21.1.172 -> 1.21.1, 21.0.5 -> 1.21, 26.1.x -> 26.1
+    int a = 0, b = 0; if (sscanf(v.c_str(), "%d.%d", &a, &b) != 2) return "";
+    if (a >= 26) return std::to_string(a) + "." + std::to_string(b);
+    return b == 0 ? "1." + std::to_string(a) : "1." + std::to_string(a) + "." + std::to_string(b);
+}
+static std::set<std::string> gQuiltGames, gNeoGames, gOptiGames;
 static std::set<std::string> gFabricGames, gForgeGames; // какие версии поддерживают загрузчики (пусто = не удалось получить, показываем все)
 static void FetchLoaderLists() {
     std::set<std::string> fab, forge;
@@ -325,7 +343,13 @@ static void FetchLoaderLists() {
     j = Parse(r.body);
     if (j.is_object() && j.contains("promos") && j["promos"].is_object())
         for (auto it = j["promos"].begin(); it != j["promos"].end(); ++it) { size_t p = it.key().rfind('-'); if (p != std::string::npos) forge.insert(it.key().substr(0, p)); }
-    std::lock_guard<std::mutex> l(gVerMu); gFabricGames = fab; gForgeGames = forge;
+    std::set<std::string> quilt, neo, opti;
+    r = Http("https://meta.quiltmc.org/v3/versions/game"); j = Parse(r.body);
+    if (j.is_array()) for (auto& x : j) if (x.is_object() && x.contains("version") && x["version"].is_string()) quilt.insert(x["version"].get<std::string>());
+    for (auto& v : NeoVersions()) { std::string m = NeoMcOf(v); if (!m.empty()) neo.insert(m); }
+    r = Http("https://bmclapi2.bangbang93.com/optifine/versionList"); j = Parse(r.body);
+    if (j.is_array()) for (auto& x : j) if (x.is_object() && x.contains("mcversion") && x["mcversion"].is_string()) opti.insert(x["mcversion"].get<std::string>());
+    std::lock_guard<std::mutex> l(gVerMu); gFabricGames = fab; gForgeGames = forge; gQuiltGames = quilt; gNeoGames = neo; gOptiGames = opti;
 }
 static bool RuleOk(const json& rules) {
     if (!rules.is_array() || rules.empty()) return true;
@@ -456,6 +480,25 @@ static std::string FindInstalled(const std::string& prefix, const std::string& s
     }
     return "";
 }
+static std::vector<std::string> LoaderProfiles(const std::string& loader, const std::string& mc) { // установленные профили загрузчика для версии игры
+    std::vector<std::string> r; std::error_code ec;
+    for (auto& e : fs::directory_iterator(gRoot / "versions", ec)) {
+        if (!e.is_directory(ec)) continue;
+        std::string n = U8(e.path().filename().string()); bool ok = false;
+        auto starts = [&](const std::string& p) { return n.rfind(p, 0) == 0; };
+        auto ends = [&](const std::string& x) { return n.size() >= x.size() && n.compare(n.size() - x.size(), x.size(), x) == 0; };
+        if (loader == "Fabric") ok = starts("fabric-loader-") && ends("-" + mc);
+        else if (loader == "Quilt") ok = starts("quilt-loader-") && ends("-" + mc);
+        else if (loader == "Forge") ok = starts(mc + "-forge-");
+        else if (loader == "OptiFine") ok = starts(mc + "-OptiFine_");
+        else if (loader == "NeoForge" && starts("neoforge-")) {
+            json j = Parse(ReadAll(e.path() / (e.path().filename().string() + ".json")));
+            ok = j.is_object() && j.contains("inheritsFrom") && j["inheritsFrom"].is_string() && j["inheritsFrom"].get<std::string>() == mc;
+        }
+        if (ok) r.push_back(n);
+    }
+    return r;
+}
 static std::string InstallFabric(const std::string& mc) {
     Status("Устанавливаю Fabric...");
     Resp r = Http("https://meta.fabricmc.net/v2/versions/loader");
@@ -495,6 +538,106 @@ static std::string InstallForge(const std::string& mc, const std::string& javaEx
         if (!have.empty()) return have;
         throw std::runtime_error("Установщик Forge завершился с кодом " + std::to_string(code) + ". Смотри вкладку «Лог».");
     }
+    return id;
+}
+
+static std::string InstallNeoForge(const std::string& mc, const std::string& javaExe) {
+    Status("Устанавливаю NeoForge (первый раз это долго)...");
+    std::string fv;
+    for (auto& v : NeoVersions()) if (NeoMcOf(v) == mc) { bool st = v.find('-') == std::string::npos; if (st || fv.empty() || fv.find('-') != std::string::npos) fv = v; }
+    if (fv.empty()) { auto have = LoaderProfiles("NeoForge", mc); if (!have.empty()) return have[0]; throw std::runtime_error("Для Minecraft " + mc + " не нашёл NeoForge (поддерживается 1.20.2 и новее)"); }
+    std::string id = "neoforge-" + fv; std::error_code ec;
+    if (fs::exists(gRoot / "versions" / P(id) / P(id + ".json"), ec)) return id;
+    fs::path inst = gRoot / "cache" / P("neoforge-" + fv + "-installer.jar");
+    if (!Download("https://maven.neoforged.net/releases/net/neoforged/neoforge/" + fv + "/neoforge-" + fv + "-installer.jar", inst)) throw std::runtime_error("Не скачался установщик NeoForge");
+    if (!fs::exists(gRoot / "launcher_profiles.json")) WriteAll(gRoot / "launcher_profiles.json", "{\"profiles\":{}}");
+    std::string cap; int code = RunProcess(Q(javaExe) + " -jar " + Q(PS(inst)) + " --install-client " + Q(PS(gRoot)), gRoot, cap);
+    if (!fs::exists(gRoot / "versions" / P(id) / P(id + ".json"), ec)) { cap.clear(); code = RunProcess(Q(javaExe) + " -jar " + Q(PS(inst)) + " --installClient " + Q(PS(gRoot)), gRoot, cap); }
+    if (!fs::exists(gRoot / "versions" / P(id) / P(id + ".json"), ec)) {
+        auto have = LoaderProfiles("NeoForge", mc); if (!have.empty()) return have[0];
+        throw std::runtime_error("Установщик NeoForge завершился с кодом " + std::to_string(code) + ". Смотри вкладку «Лог».");
+    }
+    return id;
+}
+static std::string InstallQuilt(const std::string& mc) {
+    Status("Устанавливаю Quilt...");
+    Resp r = Http("https://meta.quiltmc.org/v3/versions/loader");
+    json j = Parse(r.body); std::string loader;
+    if (j.is_array()) for (auto& x : j) if (x.is_object() && x.contains("version") && x["version"].is_string()) { std::string v = x["version"].get<std::string>(); if (!v.empty() && v.find('-') == std::string::npos) { loader = v; break; } }
+    if (loader.empty()) return FindInstalled("quilt-loader-", "-" + mc);
+    r = Http("https://meta.quiltmc.org/v3/versions/loader/" + mc + "/" + loader + "/profile/json");
+    json pj = Parse(r.body);
+    if (r.status != 200 || !pj.is_object() || !pj.contains("id")) throw std::runtime_error("Quilt пока не поддерживает версию " + mc);
+    std::string id = pj["id"].get<std::string>();
+    WriteAll(gRoot / "versions" / P(id) / P(id + ".json"), r.body);
+    return id;
+}
+struct OfV { std::string type, patch; };
+static bool OfBetter(const OfV& a, const OfV& b) { // a новее/лучше b
+    auto key = [](const OfV& o) {
+        bool hdu = o.type == "HD_U", pre = o.patch.rfind("pre", 0) == 0;
+        int letter = (!o.patch.empty() && isalpha((unsigned char)o.patch[0])) ? toupper((unsigned char)o.patch[0]) : 0, num = o.patch.size() > 1 ? atoi(o.patch.c_str() + 1) : 0;
+        return std::make_tuple(hdu, !pre, letter, num);
+    };
+    return key(a) > key(b);
+}
+static bool ExtractZipPrefix(const fs::path& zip, const std::string& prefix, const std::string& suffix, std::string& outName, std::string& outData) {
+    std::string data = ReadAll(zip); mz_zip_archive z{};
+    if (data.empty() || !mz_zip_reader_init_mem(&z, data.data(), data.size(), 0)) return false;
+    bool found = false;
+    for (mz_uint i = 0; i < mz_zip_reader_get_num_files(&z) && !found; i++) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&z, i, &st) || mz_zip_reader_is_file_a_directory(&z, i)) continue;
+        std::string n = st.m_filename;
+        if (n.rfind(prefix, 0) == 0 && n.size() > suffix.size() && n.compare(n.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            size_t sz = 0; void* p = mz_zip_reader_extract_to_heap(&z, i, &sz, 0);
+            if (p) { outName = n; outData.assign((const char*)p, sz); mz_free(p); found = true; }
+        }
+    }
+    mz_zip_reader_end(&z); return found;
+}
+// OptiFine: скачиваем jar (зеркало BMCLAPI), прогоняем optifine.Patcher над ванильным клиентом и пишем профиль версии (как делает установщик OptiFine)
+static std::string InstallOptiFine(const std::string& mc, const std::string& javaExe, const json& parent) {
+    Status("Устанавливаю OptiFine...");
+    Resp r = Http("https://bmclapi2.bangbang93.com/optifine/" + mc); json j = Parse(r.body);
+    std::optional<OfV> best;
+    if (j.is_array()) for (auto& x : j) {
+        if (!x.is_object() || !x.contains("type") || !x.contains("patch") || !x["type"].is_string() || !x["patch"].is_string()) continue;
+        OfV o{x["type"].get<std::string>(), x["patch"].get<std::string>()};
+        if (o.type.empty() || o.patch.empty()) continue;
+        if (!best || OfBetter(o, *best)) best = o;
+    }
+    if (!best) {
+        auto have = LoaderProfiles("OptiFine", mc); if (!have.empty()) return have[0];
+        throw std::runtime_error(r.status == 0 ? "Нет соединения с источником OptiFine (интернет / VPN / фаервол)" : "Для Minecraft " + mc + " нет OptiFine");
+    }
+    std::string full = mc + "_" + best->type + "_" + best->patch, id = mc + "-OptiFine_" + best->type + "_" + best->patch;
+    std::error_code ec;
+    if (fs::exists(gRoot / "versions" / P(id) / P(id + ".json"), ec)) return id;
+    fs::path inst = gRoot / "cache" / P("OptiFine_" + full + ".jar");
+    if (!Download("https://bmclapi2.bangbang93.com/optifine/" + mc + "/" + best->type + "/" + best->patch, inst)) throw std::runtime_error("Не скачался OptiFine " + full);
+    fs::path base = gRoot / "versions" / P(mc) / P(mc + ".jar");
+    fs::path target = gRoot / "libraries" / "optifine" / "OptiFine" / P(full) / P("OptiFine-" + full + ".jar");
+    fs::create_directories(target.parent_path(), ec);
+    std::string cap; int code = RunProcess(Q(javaExe) + " -cp " + Q(PS(inst)) + " optifine.Patcher " + Q(PS(base)) + " " + Q(PS(inst)) + " " + Q(PS(target)), gRoot, cap);
+    if (!fs::exists(target, ec) || fs::file_size(target, ec) == 0) {
+        fs::remove(target, ec);
+        throw std::runtime_error("Не удалось применить OptiFine (код " + std::to_string(code) + "). Смотри вкладку «Лог».");
+    }
+    json libs = json::array(); { json o; o["name"] = "optifine:OptiFine:" + full; libs.push_back(o); }
+    std::string lwName, lwData;
+    if (ExtractZipPrefix(inst, "launchwrapper-of-", ".jar", lwName, lwData)) {
+        std::string lv = lwName.substr(17, lwName.size() - 17 - 4);
+        WriteAll(gRoot / "libraries" / "optifine" / "launchwrapper-of" / P(lv) / P("launchwrapper-of-" + lv + ".jar"), lwData);
+        json o; o["name"] = "optifine:launchwrapper-of:" + lv; libs.push_back(o);
+    } else { json o; o["name"] = "net.minecraft:launchwrapper:1.12"; libs.push_back(o); }
+    json vj; vj["id"] = id; vj["inheritsFrom"] = mc; vj["mainClass"] = "net.minecraft.launchwrapper.Launch"; vj["libraries"] = libs;
+    if (parent.contains("arguments")) vj["arguments"]["game"] = json::array({"--tweakClass", "optifine.OptiFineTweaker"});
+    else {
+        std::string ma = (parent.contains("minecraftArguments") && parent["minecraftArguments"].is_string()) ? parent["minecraftArguments"].get<std::string>() : std::string();
+        vj["minecraftArguments"] = ma + " --tweakClass optifine.OptiFineTweaker";
+    }
+    WriteAll(gRoot / "versions" / P(id) / P(id + ".json"), vj.dump(2));
     return id;
 }
 
@@ -783,7 +926,12 @@ static void LoadConfig() {
 // ============================ Экземпляры ============================
 // Папка экземпляра зависит только от загрузчика и версии игры (а не от версии самого загрузчика):
 // так моды и миры не «теряются» при обновлении Fabric/Forge и лежат ровно там, откуда стартует игра.
-static std::string InstName(const std::string& loader, const std::string& mc) { return loader == "Fabric" ? mc + "-fabric" : loader == "Forge" ? mc + "-forge" : mc; }
+static const char* const kLoaders[] = {"Vanilla", "Fabric", "Forge", "NeoForge", "Quilt", "OptiFine"};
+static const int kNLoaders = 6;
+static std::string InstName(const std::string& loader, const std::string& mc) {
+    return loader == "Fabric" ? mc + "-fabric" : loader == "Forge" ? mc + "-forge" : loader == "NeoForge" ? mc + "-neoforge" :
+           loader == "Quilt" ? mc + "-quilt" : loader == "OptiFine" ? mc + "-optifine" : mc;
+}
 static void MigrateInstances() { // старые имена (fabric-loader-0.16.9-1.21.1, 1.20.1-forge-47.2.0) -> новые
     std::error_code ec; fs::path root = gRoot / "instances"; std::vector<std::string> names;
     for (auto& e : fs::directory_iterator(root, ec)) if (e.is_directory(ec)) names.push_back(U8(e.path().filename().string()));
@@ -799,18 +947,58 @@ static void MigrateInstances() { // старые имена (fabric-loader-0.16.
 static void DeleteInstance(const std::string& loader, const std::string& mc) {
     std::error_code ec; fs::path inst = gRoot / "instances", vd = gRoot / "versions";
     fs::remove_all(inst / P(InstName(loader, mc)), ec);
-    auto rmVer = [&](const std::string& pre, const std::string& suf) { // папки версий загрузчика
-        std::vector<fs::path> del;
-        for (auto& e : fs::directory_iterator(vd, ec)) {
-            std::string n = U8(e.path().filename().string());
-            if (n.size() >= pre.size() + suf.size() && n.rfind(pre, 0) == 0 && n.compare(n.size() - suf.size(), suf.size(), suf) == 0) del.push_back(e.path());
-        }
-        for (auto& d : del) fs::remove_all(d, ec);
-    };
-    if (loader == "Fabric") rmVer("fabric-loader-", "-" + mc);
-    else if (loader == "Forge") rmVer(mc + "-forge-", "");
-    else if (!fs::exists(inst / P(InstName("Fabric", mc)), ec) && !fs::exists(inst / P(InstName("Forge", mc)), ec)) fs::remove_all(vd / P(mc), ec); // ваниль нужна Fabric/Forge этой же версии
+    if (loader != "Vanilla") { for (auto& id : LoaderProfiles(loader, mc)) fs::remove_all(vd / P(id), ec); return; }
+    bool used = false; // ваниль нужна загрузчикам этой же версии
+    for (int i = 1; i < kNLoaders; i++) if (fs::exists(inst / P(InstName(kLoaders[i], mc)), ec)) used = true;
+    if (!used) fs::remove_all(vd / P(mc), ec);
 }
+
+// ---------- Настройки конкретного экземпляра (Изменить экземпляр) ----------
+struct InstCfg {
+    bool memOv = false; int minMB = 512, maxMB = 4096;
+    bool javaOv = false, skipCompat = false; std::string javaPath, jvmArgs;
+    bool mcOv = false, fullscreen = false; int width = 854, height = 480;
+    bool cmdOv = false; std::string wrapper, pre, post;
+    bool envOv = false; std::string env; // KEY=VALUE по строкам
+};
+static fs::path InstCfgPath(const fs::path& d) { return d / "poltergeist_instance.json"; }
+static InstCfg LoadInstCfg(const fs::path& d) {
+    InstCfg c; json j = Parse(ReadAll(InstCfgPath(d))); if (!j.is_object()) return c;
+    try {
+        c.memOv = j.value("memOv", false); c.minMB = j.value("minMB", 512); c.maxMB = j.value("maxMB", 4096);
+        c.javaOv = j.value("javaOv", false); c.skipCompat = j.value("skipCompat", false); c.javaPath = j.value("javaPath", ""); c.jvmArgs = j.value("jvmArgs", "");
+        c.mcOv = j.value("mcOv", false); c.fullscreen = j.value("fullscreen", false); c.width = j.value("width", 854); c.height = j.value("height", 480);
+        c.cmdOv = j.value("cmdOv", false); c.wrapper = j.value("wrapper", ""); c.pre = j.value("pre", ""); c.post = j.value("post", "");
+        c.envOv = j.value("envOv", false); c.env = j.value("env", "");
+    } catch (...) {}
+    return c;
+}
+static void SaveInstCfg(const fs::path& d, const InstCfg& c) {
+    json j; j["memOv"] = c.memOv; j["minMB"] = c.minMB; j["maxMB"] = c.maxMB; j["javaOv"] = c.javaOv; j["skipCompat"] = c.skipCompat; j["javaPath"] = c.javaPath; j["jvmArgs"] = c.jvmArgs;
+    j["mcOv"] = c.mcOv; j["fullscreen"] = c.fullscreen; j["width"] = c.width; j["height"] = c.height;
+    j["cmdOv"] = c.cmdOv; j["wrapper"] = c.wrapper; j["pre"] = c.pre; j["post"] = c.post; j["envOv"] = c.envOv; j["env"] = c.env;
+    WriteAll(InstCfgPath(d), j.dump(2));
+}
+static std::vector<std::pair<std::string, std::string>> ParseEnvText(const std::string& t) {
+    std::vector<std::pair<std::string, std::string>> r;
+    for (auto line : Split(t, '\n')) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        size_t b = line.find_first_not_of(" \t"); if (b == std::string::npos || line[b] == '#') continue;
+        size_t eq = line.find('=', b); if (eq == std::string::npos || eq == b) continue;
+        std::string k = line.substr(b, eq - b); while (!k.empty() && k.back() == ' ') k.pop_back();
+        r.push_back({k, line.substr(eq + 1)});
+    }
+    return r;
+}
+struct EnvGuard { // выставляет переменные окружения на время запуска и возвращает как было (RunProcess читает environ)
+    std::vector<std::pair<std::string, std::optional<std::string>>> old;
+    void Set(const std::string& k, const std::string& v) {
+        const char* o = getenv(k.c_str());
+        if (o) old.push_back({k, std::string(o)}); else old.push_back({k, std::nullopt});
+        setenv(k.c_str(), v.c_str(), 1);
+    }
+    ~EnvGuard() { for (size_t i = old.size(); i-- > 0;) { if (old[i].second) setenv(old[i].first.c_str(), old[i].second->c_str(), 1); else unsetenv(old[i].first.c_str()); } }
+};
 
 static void SetGameDir(const std::string& d) { // пустая строка = стандартная папка
     if (gBusy) return;
@@ -827,6 +1015,11 @@ static void LaunchThread(Config c, Account acc) {
     try {
         if (acc.type == 2) { Status("Обновляю сессию Microsoft..."); MsRefresh(acc); { std::lock_guard<std::mutex> l(gMu); gNewAcc = acc; } }
         else if (acc.type == 1) { Status("Проверяю сессию Ely.by..."); ElyRefresh(acc); { std::lock_guard<std::mutex> l(gMu); gNewAcc = acc; } }
+        fs::path gameDir = gRoot / "instances" / P(InstName(c.loader, c.version));
+        InstCfg ic = LoadInstCfg(gameDir); // свои настройки экземпляра
+        if (ic.javaOv) { c.javaPath = ic.javaPath; c.jvmArgs = ic.jvmArgs; }
+        int xmx = c.ramMB, xms = std::min(c.ramMB, 512);
+        if (ic.memOv) { xmx = std::max(256, ic.maxMB); xms = std::clamp(ic.minMB, 128, xmx); }
         Status("Получаю описание версии " + c.version);
         json v = LoadVersionJson(c.version);
         if (v.is_null()) throw std::runtime_error("Не удалось получить версию " + c.version + " (нет интернета?)");
@@ -834,16 +1027,22 @@ static void LaunchThread(Config c, Account acc) {
         std::string javaPick = c.javaPath.empty() ? EnsureJava(need) : JavaExe(c.javaPath);
         if (javaPick.empty()) throw std::runtime_error("Java не найдена и не скачалась");
         std::string launchId = c.version;
-        fs::path gameDir = gRoot / "instances" / P(InstName(c.loader, c.version));
         Prep pre; Prepare(v, c.version, gameDir, pre); // сначала ваниль (нужна и Forge-установщику)
         if (c.loader == "Fabric") launchId = InstallFabric(c.version);
         else if (c.loader == "Forge") launchId = InstallForge(c.version, javaPick);
+        else if (c.loader == "NeoForge") launchId = InstallNeoForge(c.version, javaPick);
+        else if (c.loader == "Quilt") launchId = InstallQuilt(c.version);
+        else if (c.loader == "OptiFine") launchId = InstallOptiFine(c.version, javaPick, v);
         if (launchId.empty()) throw std::runtime_error("Не удалось установить " + c.loader);
         json lv = launchId == c.version ? v : LoadVersionJson(launchId);
         if (lv.is_null()) throw std::runtime_error("Не нашёл описание профиля " + launchId);
         int need2 = lv.contains("javaVersion") ? lv["javaVersion"].value("majorVersion", 8) : 8;
         std::string java = c.javaPath.empty() ? EnsureJava(need2) : javaPick;
         if (java.empty()) throw std::runtime_error("Java не найдена");
+        if (!c.javaPath.empty() && !(ic.javaOv && ic.skipCompat)) { // проверка совместимости своей Java
+            int jm = JavaMajorFromHome(P(java).parent_path().parent_path());
+            if (jm > 0 && jm < need2) throw std::runtime_error("Выбранная Java " + std::to_string(jm) + " слишком старая: для " + launchId + " нужна Java " + std::to_string(need2) + ". Выбери другую Java или включи «Пропустить проверку совместимости» в настройках экземпляра.");
+        }
         Prep pp; Prepare(lv, launchId, gameDir, pp);
         std::error_code ec; fs::create_directories(gameDir, ec); // экземпляр «установлен» только после успешной подготовки
 
@@ -874,7 +1073,11 @@ static void LaunchThread(Config c, Account acc) {
             jvm = {Sub("-Djava.library.path=${natives_directory}", vars), "-cp", pp.cp};
             for (auto& s : Split(lv.value("minecraftArguments", ""), ' ')) if (!s.empty()) game.push_back(Sub(s, vars));
         }
-        std::string cmd = Q(JavaExe(java)) + " -Xmx" + std::to_string(c.ramMB) + "M -Xms" + std::to_string(std::min(c.ramMB, 512)) + "M -XX:+UseG1GC -XX:MaxGCPauseMillis=50";
+        if (ic.mcOv) { // параметры окна игры
+            if (ic.fullscreen) game.push_back("--fullscreen");
+            else { game.push_back("--width"); game.push_back(std::to_string(ic.width)); game.push_back("--height"); game.push_back(std::to_string(ic.height)); }
+        }
+        std::string cmd = Q(JavaExe(java)) + " -Xmx" + std::to_string(xmx) + "M -Xms" + std::to_string(xms) + "M -XX:+UseG1GC -XX:MaxGCPauseMillis=50";
         if (acc.type == 1) {
             fs::path ai = gRoot / "cache" / "authlib-injector.jar";
             if (!Download(kAuthlibUrl, ai)) throw std::runtime_error("Не скачался authlib-injector (нужен для Ely.by)");
@@ -886,6 +1089,19 @@ static void LaunchThread(Config c, Account acc) {
         cmd += " " + Q(lv.value("mainClass", "net.minecraft.client.main.Main"));
         for (auto& s : game) cmd += " " + Q(s);
 
+        // пользовательские команды и переменные окружения экземпляра
+        std::map<std::string, std::string> iv = {{"INST_NAME", InstName(c.loader, c.version)}, {"INST_ID", launchId}, {"INST_DIR", PS(gameDir)}, {"INST_MC_DIR", PS(gameDir)},
+                                                 {"INST_JAVA", JavaExe(java)}, {"INST_MC_VER", c.version}, {"INST_LOADER", c.loader}};
+        auto sd = [&](std::string t) { for (auto& [k, val] : iv) { std::string key = "$" + k; size_t p = 0; while ((p = t.find(key, p)) != std::string::npos) { t.replace(p, key.size(), val); p += val.size(); } } return t; };
+        EnvGuard eg; for (auto& [k, val] : iv) eg.Set(k, val);
+        if (ic.envOv) for (auto& kv : ParseEnvText(ic.env)) eg.Set(kv.first, sd(kv.second));
+        if (ic.cmdOv && !ic.wrapper.empty()) cmd = sd(ic.wrapper) + " " + cmd;
+        if (ic.cmdOv && !ic.pre.empty()) {
+            Status("Выполняю команду перед запуском...");
+            std::string pc; int pcode = RunProcess("/bin/sh -c " + Q(sd(ic.pre)), gameDir, pc);
+            if (pcode != 0) throw std::runtime_error("Команда перед запуском завершилась с кодом " + std::to_string(pcode) + ", игра не запущена.");
+        }
+
         gProg = 1.0f; Status("Игра запущена (" + launchId + ")");
         gGameRunning = true; int act = c.onLaunch;
         if (act == 1 || act == 2) std::thread([act] { // свернуть/закрыть лаунчер, если игра успешно стартовала и не упала
@@ -895,6 +1111,7 @@ static void LaunchThread(Config c, Account acc) {
         }).detach();
         std::string cap; int code = RunProcess(cmd, gameDir, cap);
         gGameRunning = false;
+        if (ic.cmdOv && !ic.post.empty()) { std::string pc2; RunProcess("/bin/sh -c " + Q(sd(ic.post)), gameDir, pc2); }
         if (act == 1) gWinCmd = 2; // игра закрылась - вернуть лаунчер из фона
         if (gLogOn) WriteAll(gCfgDir / "latest.log", cap);
         if (code != 0) { auto [t, b] = Analyze(code, cap); Status("Игра завершилась с ошибкой: " + t); ShowError(t, b); }
@@ -1083,16 +1300,38 @@ static void IconCross(ImDrawList* dl, ImVec2 m, float s, ImU32 col) {
     dl->AddLine(ImVec2(m.x - s * .8f, m.y - s * .8f), ImVec2(m.x + s * .8f, m.y + s * .8f), col, th);
     dl->AddLine(ImVec2(m.x - s * .8f, m.y + s * .8f), ImVec2(m.x + s * .8f, m.y - s * .8f), col, th);
 }
+static void IconTrash(ImDrawList* dl, ImVec2 m, float s, ImU32 col) { // корзина для мусора
+    float th = std::max(1.5f, 1.6f * gS);
+    ImVec2 body[4] = {ImVec2(m.x - s * .62f, m.y - s * .28f), ImVec2(m.x + s * .62f, m.y - s * .28f), ImVec2(m.x + s * .48f, m.y + s * .95f), ImVec2(m.x - s * .48f, m.y + s * .95f)};
+    dl->AddPolyline(body, 4, col, ImDrawFlags_Closed, th);
+    dl->AddLine(ImVec2(m.x - s * .88f, m.y - s * .5f), ImVec2(m.x + s * .88f, m.y - s * .5f), col, th);
+    dl->AddLine(ImVec2(m.x - s * .28f, m.y - s * .5f), ImVec2(m.x - s * .28f, m.y - s * .86f), col, th);
+    dl->AddLine(ImVec2(m.x + s * .28f, m.y - s * .5f), ImVec2(m.x + s * .28f, m.y - s * .86f), col, th);
+    dl->AddLine(ImVec2(m.x - s * .28f, m.y - s * .86f), ImVec2(m.x + s * .28f, m.y - s * .86f), col, th);
+    dl->AddLine(ImVec2(m.x - s * .2f, m.y + s * .05f), ImVec2(m.x - s * .16f, m.y + s * .68f), col, th * .8f);
+    dl->AddLine(ImVec2(m.x + s * .2f, m.y + s * .05f), ImVec2(m.x + s * .16f, m.y + s * .68f), col, th * .8f);
+}
+static void DrawTrash(ImDrawList* dl, ImVec2 a, ImVec2 b, bool hov, bool enabled) {
+    ImVec2 m((a.x + b.x) / 2, (a.y + b.y) / 2); float s = (b.y - a.y) * .30f;
+    if (hov && enabled) dl->AddRectFilled(a, b, IM_COL32(225, 70, 70, 70), R((b.y - a.y) * .3f));
+    IconTrash(dl, m, s, (hov && enabled) ? IM_COL32(255, 100, 100, 255) : IM_COL32(235, 85, 85, enabled ? 205 : 90));
+}
+static bool TrashBtn(const char* id, float sz, bool enabled = true) { // квадратная кнопка-корзина
+    ImGui::PushID(id); ImVec2 p = ImGui::GetCursorScreenPos();
+    bool clk = ImGui::InvisibleButton("##tr", ImVec2(sz, sz)), hov = ImGui::IsItemHovered();
+    DrawTrash(ImGui::GetWindowDrawList(), p, ImVec2(p.x + sz, p.y + sz), hov, enabled);
+    ImGui::PopID(); return clk && enabled;
+}
 static void Open(const fs::path& p) { std::error_code ec; fs::create_directories(p, ec); OpenExternal(PS(p)); }
 static std::string AccLabel(const Account& a) { return std::string(a.type == 0 ? T("[офлайн] ", "[offline] ") : a.type == 1 ? "[Ely.by] " : "[Microsoft] ") + a.name; }
 
-static void TabBar(const char* const* labels, int n, int& cur) {
+static void TabBar(const char* const* labels, int n, int& cur, bool fade = true) {
     float em = ImGui::GetFontSize(), h = em * 1.9f; ImVec2 s = ImGui::GetCursorScreenPos(); float x = s.x, tx = s.x, tw = 0;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     for (int i = 0; i < n; i++) {
         ImVec2 ts = ImGui::CalcTextSize(labels[i]); float w = ts.x + em * 1.2f;
         ImGui::SetCursorScreenPos(ImVec2(x, s.y)); ImGui::PushID(i);
-        if (ImGui::InvisibleButton("##t", ImVec2(w, h)) && cur != i) { cur = i; gScrFade = 0; }
+        if (ImGui::InvisibleButton("##t", ImVec2(w, h)) && cur != i) { cur = i; if (fade) gScrFade = 0; }
         float t = AnimK("h", (ImGui::IsItemHovered() || cur == i) ? 1.f : 0.f, 12.f);
         dl->AddText(ImVec2(x + em * .6f, s.y + (h - ts.y) / 2), TextCol(.5f + .5f * t), labels[i]);
         if (cur == i) { tx = x; tw = w; }
@@ -1108,6 +1347,9 @@ static bool VerShown(const Ver& v, const std::string& loader) { // вызыва�
     if (v.type == "old_alpha" && !cfg.showAlpha) return false;
     if (loader == "Fabric" && !gFabricGames.empty()) return gFabricGames.count(v.id) > 0;
     if (loader == "Forge" && !gForgeGames.empty()) return gForgeGames.count(v.id) > 0;
+    if (loader == "Quilt" && !gQuiltGames.empty()) return gQuiltGames.count(v.id) > 0;
+    if (loader == "NeoForge" && !gNeoGames.empty()) return gNeoGames.count(v.id) > 0;
+    if (loader == "OptiFine" && !gOptiGames.empty()) return gOptiGames.count(v.id) > 0;
     return true;
 }
 static fs::path CurrentInstanceDir() { return gRoot / "instances" / P(InstName(cfg.loader, cfg.version)); } // папка игры для выбранных загрузчика и версии
@@ -1130,7 +1372,10 @@ struct InstInfo { std::string name, loader, ver; };
 static InstInfo ParseInst(const std::string& n) {
     InstInfo r; r.name = n; r.loader = "Vanilla"; r.ver = n;
     auto ends = [&](const char* sfx) { size_t l = strlen(sfx); return n.size() > l && n.compare(n.size() - l, l, sfx) == 0; };
-    if (ends("-fabric")) { r.loader = "Fabric"; r.ver = n.substr(0, n.size() - 7); }
+    if (ends("-neoforge")) { r.loader = "NeoForge"; r.ver = n.substr(0, n.size() - 9); }
+    else if (ends("-quilt")) { r.loader = "Quilt"; r.ver = n.substr(0, n.size() - 6); }
+    else if (ends("-optifine")) { r.loader = "OptiFine"; r.ver = n.substr(0, n.size() - 9); }
+    else if (ends("-fabric")) { r.loader = "Fabric"; r.ver = n.substr(0, n.size() - 7); }
     else if (ends("-forge")) { r.loader = "Forge"; r.ver = n.substr(0, n.size() - 6); }
     else if (n.rfind("fabric-loader-", 0) == 0) { std::string rest = n.substr(14); size_t p = rest.find('-'); r.loader = "Fabric"; r.ver = p == std::string::npos ? rest : rest.substr(p + 1); }
     else { size_t p = n.find("-forge-"); if (p != std::string::npos && p > 0) { r.loader = "Forge"; r.ver = n.substr(0, p); } }
@@ -1232,12 +1477,13 @@ static void ModDelete(const fs::path& inst, const std::string& pid) {
     for (auto& f : it->second) fs::remove(inst / "mods" / P(f), ec);
     gModFiles.erase(it); SaveModFiles();
 }
-static std::string LoaderId(const std::string& l) { return l == "Fabric" ? "fabric" : l == "Forge" ? "forge" : ""; }
+static std::string LoaderId(const std::string& l) { return l == "Fabric" ? "fabric" : l == "Forge" ? "forge" : l == "NeoForge" ? "neoforge" : l == "Quilt" ? "quilt" : ""; }
 static void ModMsg(const std::string& s) { { std::lock_guard<std::mutex> l(gModMu); gModMsg = s; } Log(s); }
 static void ModSearchThread(std::string q, std::string loader, std::string mc) {
     gModBusy = true;
     try {
-        std::string fac = "[[\"project_type:mod\"],[\"categories:" + loader + "\"],[\"versions:" + mc + "\"]]";
+        std::string cat = loader == "quilt" ? std::string("\"categories:quilt\",\"categories:fabric\"") : "\"categories:" + loader + "\"";
+        std::string fac = "[[\"project_type:mod\"],[" + cat + "],[\"versions:" + mc + "\"]]";
         std::string url = "https://api.modrinth.com/v2/search?query=" + UrlEnc(q) + "&facets=" + UrlEnc(fac) + "&limit=40&index=" + (q.empty() ? "downloads" : "relevance");
         Resp r = Http(url); json j = Parse(r.body); std::vector<ModHit> out;
         if (r.status == 200 && j.is_object() && j.contains("hits") && j["hits"].is_array())
@@ -1255,7 +1501,7 @@ static void ModSearchThread(std::string q, std::string loader, std::string mc) {
 }
 static bool InstallModRec(const std::string& pid, const std::string& loader, const std::string& mc, const fs::path& inst, std::set<std::string>& seen, int depth) {
     if (!seen.insert(pid).second) return true;
-    Resp r = Http("https://api.modrinth.com/v2/project/" + UrlEnc(pid) + "/version?loaders=" + UrlEnc("[\"" + loader + "\"]") + "&game_versions=" + UrlEnc("[\"" + mc + "\"]"));
+    Resp r = Http("https://api.modrinth.com/v2/project/" + UrlEnc(pid) + "/version?loaders=" + UrlEnc(loader == "quilt" ? std::string("[\"quilt\",\"fabric\"]") : "[\"" + loader + "\"]") + "&game_versions=" + UrlEnc("[\"" + mc + "\"]"));
     if (r.status == 0) throw std::runtime_error(T("Нет соединения с Modrinth", "No connection to Modrinth"));
     json a = Parse(r.body);
     if (r.status != 200 || !a.is_array() || a.empty()) return false;
@@ -1301,6 +1547,7 @@ static void ModrinthCheckThread() {
 struct NewsItem { const char* ver; const char* ru; const char* en; };
 static int gNewsTab = 0; // 0 новости лаунчера, 1 новости игры
 static const NewsItem kNews[] = { // новые сверху
+    {"v0.0.5", "Все загрузчики (NeoForge, Quilt, OptiFine), выпадающий выбор загрузчика, корзина вместо кнопки «Удалить», полноценные настройки экземпляра: миры, версия, память, Java, команды.", "All loaders (NeoForge, Quilt, OptiFine), dropdown loader picker, trash icon instead of the Delete button, full instance settings: worlds, version, memory, Java, commands."},
     {"v0.0.4", "Фикс визуала и добавление настроек экземпляра.", "Visual fixes and instance settings added."},
     {"v0.0.3", "Добавлено больше настроек. И моды.", "More settings added. And mods."},
     {"v0.0.2", "Hotfix Java. Скачивалась не та версия для 26.1-26.3.", "Java hotfix. The wrong Java version was downloaded for 26.1-26.3."},
@@ -1395,7 +1642,7 @@ static void ScrMain() {
             ImGui::EndPopup();
         }
     }
-    if (cfg.modsOn) { ImGui::SameLine(); if (FancyBtn(T("Моды (бета)", "Mods (beta)"), ImVec2(sbw, em * 1.9f), gSoft)) Go(S_MODS); }
+    if (cfg.modsOn) { ImGui::SameLine(); if (FancyBtn(T("Моды", "Mods"), ImVec2(sbw, em * 1.9f), gSoft)) Go(S_MODS); }
 
     // нижний ряд: версия | ИГРАТЬ | аккаунт
     float avail = ImGui::GetContentRegionAvail().x, bh = em * 2.8f, wl = (avail - 2 * sp) * 0.30f, wc = avail - 2 * sp - 2 * wl; bool busy = gBusy;
@@ -1407,38 +1654,43 @@ static void ScrMain() {
         ImGui::SetNextWindowSize(ImVec2(std::max(bmax.x - bmin.x, em * 16.f), std::max(em * 8.f, std::min(em * 19.f, bmin.y - em))));
         if (ImGui::BeginPopup("##vers")) {
             RefreshInstNames();
-            const char* ld[] = {"Vanilla", "Fabric", "Forge"}; float sp2 = ImGui::GetStyle().ItemSpacing.x, bw = (ImGui::GetContentRegionAvail().x - 2 * sp2) / 3;
-            for (int i = 0; i < 3; i++) {
-                if (i) ImGui::SameLine();
-                bool sel = cfg.loader == ld[i];
-                if (FancyBtn(ld[i], ImVec2(bw, em * 1.9f), sel ? gAccent : gSoft) && !sel) {
-                    cfg.loader = ld[i];
+            { // выбор загрузчика: выпадающий список (как выбор видеокарты)
+                auto fixVer = [&] {
                     std::lock_guard<std::mutex> l(gVerMu); bool ok = false;
                     for (auto& v : gVers) if (v.id == cfg.version && VerShown(v, cfg.loader)) ok = true;
                     if (!ok) { // выбранной версии у этого загрузчика нет — берём самую новую подходящую
                         for (auto& v : gVers) if (v.type == "release" && VerShown(v, cfg.loader)) { cfg.version = v.id; ok = true; break; }
                         if (!ok) for (auto& v : gVers) if (VerShown(v, cfg.loader)) { cfg.version = v.id; break; }
                     }
+                };
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo("##ldr", cfg.loader.c_str())) {
+                    for (int i = 0; i < kNLoaders; i++) {
+                        bool sel = cfg.loader == kLoaders[i];
+                        if (ImGui::Selectable(kLoaders[i], sel) && !sel) { cfg.loader = kLoaders[i]; fixVer(); }
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
                 }
             }
             ImGui::Separator();
             ImGui::BeginChild("##vlist", ImVec2(0, 0), false);
             {
                 std::lock_guard<std::mutex> l(gVerMu);
-                const char* dlab = T("Удалить", "Delete"); float dbw = ImGui::CalcTextSize(dlab).x + ImGui::GetStyle().FramePadding.x * 2;
                 for (auto& v : gVers) {
                     if (!VerShown(v, cfg.loader)) continue;
                     std::string lab = v.id + (v.type == "snapshot" ? T("   [снапшот]", "   [snapshot]") : v.type == "old_beta" ? T("   [бета]", "   [beta]") : v.type == "old_alpha" ? T("   [альфа]", "   [alpha]") : "");
-                    bool has = gInstNames.count(InstName(cfg.loader, v.id)) > 0; ImGui::PushID(v.id.c_str());
-                    float selW = ImGui::GetContentRegionAvail().x - (has ? dbw + ImGui::GetStyle().ItemSpacing.x : 0.f);
-                    if (ImGui::Selectable(lab.c_str(), v.id == cfg.version, 0, ImVec2(selW, 0))) { cfg.version = v.id; ImGui::CloseCurrentPopup(); }
-                    if (has) { // версия установлена - рядом кнопка «Удалить» (с подтверждением)
-                        ImGui::SameLine(); bool off = gBusy || gGameRunning || gDelBusy;
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(.88f, .28f, .28f, .40f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(.88f, .28f, .28f, .70f)); ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(.88f, .28f, .28f, .90f));
-                        ImGui::BeginDisabled(off);
-                        if (ImGui::SmallButton(dlab)) { gDelAsk = DelReq{cfg.loader, v.id}; ImGui::CloseCurrentPopup(); }
-                        ImGui::EndDisabled(); ImGui::PopStyleColor(3);
+                    bool has = gInstNames.count(InstName(cfg.loader, v.id)) > 0, off = gBusy || gGameRunning || gDelBusy;
+                    ImGui::PushID(v.id.c_str());
+                    bool clicked = ImGui::Selectable(lab.c_str(), v.id == cfg.version); // полоска выбора — на всю строку
+                    if (has) { // версия установлена — справа корзина (удаление с подтверждением)
+                        ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax(); float h = b.y - a.y, pad = 6.f * gS;
+                        ImVec2 ta(b.x - h * 1.1f - pad, a.y), tb(b.x - pad, b.y);
+                        bool hovT = ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(ta, tb);
+                        DrawTrash(ImGui::GetWindowDrawList(), ta, tb, hovT, !off);
+                        if (clicked && hovT) { clicked = false; if (!off) { gDelAsk = DelReq{cfg.loader, v.id}; ImGui::CloseCurrentPopup(); } }
                     }
+                    if (clicked) { cfg.version = v.id; ImGui::CloseCurrentPopup(); }
                     ImGui::PopID();
                 }
             }
@@ -1519,7 +1771,7 @@ static void ScrAccounts() {
 // ---------- Моды ----------
 static void ScrMods() {
     float em = ImGui::GetFontSize(); ImDrawList* dl = ImGui::GetWindowDrawList();
-    if (Header(T("Моды (бета)", "Mods (beta)"))) { Go(S_MAIN); return; }
+    if (Header(T("Моды", "Mods"))) { Go(S_MAIN); return; }
     std::string ld = LoaderId(cfg.loader);
     std::string key = gWantQ + "|" + ld + "|" + cfg.version;
     if (!ld.empty() && !cfg.version.empty() && key != gModKey && !gModBusy) { gModKey = key; std::thread(ModSearchThread, gWantQ, ld, cfg.version).detach(); }
@@ -1533,7 +1785,7 @@ static void ScrMods() {
     if (FancyBtn(T("Найти", "Search"), ImVec2(0, em * 2.f), gSoft)) go = true;
     if (go) { gWantQ = bModQ; gModKey.clear(); } // повторный поиск даже с тем же запросом
     std::string msg; { std::lock_guard<std::mutex> l(gModMu); msg = gModMsg; }
-    if (ld.empty()) msg = T("Для модов выбери загрузчик Fabric или Forge на главном экране.", "Pick the Fabric or Forge loader on the main screen to use mods.");
+    if (ld.empty()) msg = T("Для модов выбери загрузчик Fabric, Forge, NeoForge или Quilt на главном экране.", "Pick the Fabric, Forge, NeoForge or Quilt loader on the main screen to use mods.");
     if (!msg.empty()) { ImGui::PushTextWrapPos(0.f); ImGui::TextColored(gAccent, "%s", msg.c_str()); ImGui::PopTextWrapPos(); }
     ImGui::EndChild();
     ImGui::SameLine();
@@ -1577,6 +1829,237 @@ static void ScrLog() {
     ImGui::EndChild();
 }
 
+// ---------- Изменить экземпляр ----------
+struct WorldInfo { std::string name, date; };
+static std::vector<WorldInfo> gWorlds; static float gWorldsT = 99.f;
+static std::map<std::string, long long> gWorldSz; static std::set<std::string> gWorldSzBusy; static std::mutex gWsMu;
+static std::atomic<bool> gWorldBusy{false};
+static std::string gWorldAsk, gWorldDel; // запрос на удаление мира
+static InstCfg gEd; static std::string gEdName; static int gEdTab = 0, gEdNeedJava = 0;
+static char eJava[260], eJvm[512], eWrap[512], ePre[512], ePost[512], eEnv[2048];
+static std::vector<std::string> gComps; static float gCompsT = 99.f;
+
+static bool ZipDir(const fs::path& dir, const std::string& top, const fs::path& zipPath) { // папка -> zip (внутри лежит папка top)
+    std::error_code ec; fs::create_directories(zipPath.parent_path(), ec);
+    FILE* f = fopen(zipPath.string().c_str(), "wb"); if (!f) return false;
+    mz_zip_archive z{};
+    if (!mz_zip_writer_init_cfile(&z, f, 0)) { fclose(f); return false; }
+    bool ok = true;
+    for (auto it = fs::recursive_directory_iterator(dir, ec); it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+        fs::path rel = fs::relative(it->path(), dir, ec); if (ec) continue;
+        if (rel.filename() == "session.lock") continue; // файл блокировки открытого мира
+        std::string name = top + "/" + PS(rel); for (auto& ch : name) if (ch == '\\') ch = '/';
+        std::string data = ReadAll(it->path());
+        if (!mz_zip_writer_add_mem(&z, name.c_str(), data.data(), data.size(), MZ_DEFAULT_LEVEL)) { ok = false; break; }
+    }
+    if (ok) ok = mz_zip_writer_finalize_archive(&z) != 0;
+    mz_zip_writer_end(&z); fclose(f);
+    if (!ok) fs::remove(zipPath, ec);
+    return ok;
+}
+static std::string FmtWriteDate(const fs::path& p) {
+    struct stat sb; if (stat(p.c_str(), &sb) != 0) return "?";
+    time_t tt = sb.st_mtime; struct tm tmv; if (!localtime_r(&tt, &tmv)) return "?";
+    char b2[48]; snprintf(b2, sizeof(b2), "%02d.%02d.%04d %02d:%02d", tmv.tm_mday, tmv.tm_mon + 1, tmv.tm_year + 1900, tmv.tm_hour, tmv.tm_min);
+    return b2;
+}
+static void WorldSizeThread(std::string key, fs::path dir) {
+    std::error_code ec; long long sum = 0;
+    for (auto it = fs::recursive_directory_iterator(dir, ec); it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) break;
+        if (it->is_regular_file(ec)) sum += (long long)it->file_size(ec);
+    }
+    std::lock_guard<std::mutex> l(gWsMu); gWorldSz[key] = sum; gWorldSzBusy.erase(key);
+}
+static void ScanWorlds(bool force) {
+    gWorldsT += ImGui::GetIO().DeltaTime; if (!force && gWorldsT < 1.5f) return; gWorldsT = 0;
+    std::vector<WorldInfo> v; std::error_code ec;
+    for (auto& e : fs::directory_iterator(gRoot / "instances" / P(gEdName) / "saves", ec))
+        if (e.is_directory(ec)) { WorldInfo w; w.name = U8(e.path().filename().string()); w.date = FmtWriteDate(e.path()); v.push_back(w); }
+    std::sort(v.begin(), v.end(), [](const WorldInfo& a, const WorldInfo& b) { return a.name < b.name; });
+    gWorlds = v;
+}
+static std::string PickSaveZip(void*, const std::string& defName) { // нужен zenity или kdialog
+    if (HaveCmd("zenity")) return RunCapture("zenity --file-selection --save --confirm-overwrite --filename=" + ShQ(HomeDir() + "/" + defName) + " 2>/dev/null");
+    if (HaveCmd("kdialog")) return RunCapture("kdialog --getsavefilename " + ShQ(HomeDir() + "/" + defName) + " " + ShQ("*.zip|ZIP") + " 2>/dev/null");
+    Status(T("Для выбора файла нужен zenity или kdialog (установи через менеджер пакетов)", "zenity or kdialog is needed to choose a file (install it with your package manager)")); return "";
+}
+static void WorldTask(int kind, std::string inst, std::string world, std::string outPath) { // 0 бэкап, 1 экспорт, 2 удаление
+    gWorldBusy = true; std::error_code ec;
+    fs::path dir = gRoot / "instances" / P(inst) / "saves" / P(world);
+    if (kind == 2) {
+        Status(std::string(T("Удаляю мир: ", "Deleting world: ")) + world); fs::remove_all(dir, ec);
+        Status(std::string(T("Мир удалён: ", "World deleted: ")) + world);
+    } else {
+        fs::path z; std::string what;
+        if (kind == 0) {
+            time_t now = time(nullptr); struct tm st; localtime_r(&now, &st); char ts[64];
+            snprintf(ts, sizeof(ts), "%04d-%02d-%02d_%02d-%02d-%02d", st.tm_year + 1900, st.tm_mon + 1, st.tm_mday, st.tm_hour, st.tm_min, st.tm_sec);
+            z = gRoot / "instances" / P(inst) / "poltergeist_backups" / P(world + "_" + ts + ".zip"); what = T("Резервная копия", "Backup");
+        } else { z = P(outPath); what = T("Экспорт мира", "World export"); }
+        Status(what + ": " + world + "...");
+        bool ok = ZipDir(dir, world, z);
+        Status(ok ? what + std::string(T(" готов: ", " done: ")) + PS(z.filename()) : what + T(" не удался", " failed"));
+    }
+    gWorldBusy = false;
+}
+static void InstEditorOpen(const std::string& name) {
+    gEdName = name; gEd = LoadInstCfg(gRoot / "instances" / P(name));
+    snprintf(eJava, sizeof(eJava), "%s", gEd.javaPath.c_str()); snprintf(eJvm, sizeof(eJvm), "%s", gEd.jvmArgs.c_str());
+    snprintf(eWrap, sizeof(eWrap), "%s", gEd.wrapper.c_str()); snprintf(ePre, sizeof(ePre), "%s", gEd.pre.c_str()); snprintf(ePost, sizeof(ePost), "%s", gEd.post.c_str());
+    snprintf(eEnv, sizeof(eEnv), "%s", gEd.env.c_str());
+    gEdTab = 0; gWorldsT = 99.f; gCompsT = 99.f; gWorldAsk.clear();
+    { std::lock_guard<std::mutex> l(gWsMu); gWorldSz.clear(); }
+    InstInfo ii = ParseInst(name); gEdNeedJava = 0;
+    json vj = Parse(ReadAll(gRoot / "versions" / P(ii.ver) / P(ii.ver + ".json")));
+    if (vj.is_object() && vj.contains("javaVersion") && vj["javaVersion"].is_object() && vj["javaVersion"].contains("majorVersion") && vj["javaVersion"]["majorVersion"].is_number_integer())
+        gEdNeedJava = vj["javaVersion"]["majorVersion"].get<int>();
+    RefreshJavas();
+}
+static void InstEditorBody(bool& close) {
+    float em = ImGui::GetFontSize(); InstInfo ii = ParseInst(gEdName); fs::path dir = gRoot / "instances" / P(gEdName);
+    ImGuiIO& io = ImGui::GetIO(); bool ch = false;
+    ImGui::PushFont(gFSub); ImGui::TextColored(gAccent, "%s  %s", ii.loader.c_str(), ii.ver.c_str()); ImGui::PopFont();
+    const char* labs[7] = {T("Миры", "Worlds"), T("Версия", "Version"), T("Память", "Memory"), "Java", "Minecraft", T("Команды", "Commands"), T("Окружение", "Environment")};
+    TabBar(labs, 7, gEdTab, false);
+    ImGui::BeginChild("##ebody", ImVec2(0, -(em * 2.8f)), 0, ImGuiWindowFlags_NoBackground);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (gEdTab == 0) { // ---- Миры ----
+        ScanWorlds(false); bool busyW = gWorldBusy;
+        if (FancyBtn(T("Папка saves", "Saves folder"), ImVec2(em * 10, em * 1.9f), gSoft)) Open(dir / "saves");
+        ImGui::SameLine(); if (FancyBtn(T("Папка бэкапов", "Backups folder"), ImVec2(em * 11, em * 1.9f), gSoft)) Open(dir / "poltergeist_backups");
+        TD(T("Список локальных миров. Бэкап кладётся в папку бэкапов, экспорт — в zip, который выберешь сам.", "Local worlds. A backup goes to the backups folder, export saves a zip where you choose."));
+        if (gWorlds.empty()) TD(T("В этом экземпляре пока нет миров.", "No worlds in this instance yet."));
+        for (int i = 0; i < (int)gWorlds.size(); i++) {
+            const WorldInfo& w = gWorlds[i]; ImGui::PushID(i);
+            float aw = ImGui::GetContentRegionAvail().x, rh = em * 3.0f, bh = em * 1.9f, bw = em * 7.f, tw = em * 2.2f, gp = em * .4f; ImVec2 p = ImGui::GetCursorScreenPos();
+            float x = p.x + aw - em * .6f - tw, by = p.y + (rh - bh) / 2;
+            dl->AddRectFilled(p, ImVec2(p.x + aw, p.y + rh), ImGui::GetColorU32(gSoft), R(em * .6f));
+            std::string szs = "...";
+            { std::lock_guard<std::mutex> l(gWsMu); auto f = gWorldSz.find(w.name);
+              if (f != gWorldSz.end()) szs = FmtSize(f->second); else if (gWorldSzBusy.insert(w.name).second) std::thread(WorldSizeThread, w.name, dir / "saves" / P(w.name)).detach(); }
+            float maxw = std::max(em * 4.f, aw - (bw * 2 + tw + gp * 3 + em * 1.6f));
+            ImVec4 clip(p.x, p.y, p.x + em + maxw, p.y + rh);
+            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(p.x + em, p.y + em * .45f), TextCol(), w.name.c_str(), nullptr, 0.f, &clip);
+            std::string sub = w.date + "  |  " + szs;
+            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(p.x + em, p.y + em * 1.55f), TextCol(.55f), sub.c_str(), nullptr, 0.f, &clip);
+            ImGui::SetCursorScreenPos(ImVec2(x - gp * 2 - bw * 2, by));
+            if (FancyBtn(T("Бэкап", "Backup"), ImVec2(bw, bh), gSoft, !busyW)) std::thread(WorldTask, 0, gEdName, w.name, std::string()).detach();
+            ImGui::SetCursorScreenPos(ImVec2(x - gp - bw, by));
+            if (FancyBtn(T("Экспорт", "Export"), ImVec2(bw, bh), gSoft, !busyW)) { std::string out = PickSaveZip(nullptr, w.name + ".zip"); if (!out.empty()) std::thread(WorldTask, 1, gEdName, w.name, out).detach(); }
+            ImGui::SetCursorScreenPos(ImVec2(x, p.y + (rh - tw) / 2));
+            if (TrashBtn("del", tw, !busyW && !gGameRunning)) gWorldAsk = w.name;
+            ImGui::SetCursorScreenPos(p); ImGui::Dummy(ImVec2(aw, rh));
+            ImGui::PopID();
+        }
+        if (busyW) { std::string st; { std::lock_guard<std::mutex> l(gMu); st = gStatus; } ImGui::TextColored(gAccent, "%s", st.c_str()); }
+    } else if (gEdTab == 1) { // ---- Версия ----
+        auto Row = [&](const char* k, const std::string& v) { ImGui::TextDisabled("%s", k); ImGui::SameLine(em * 11.f); ImGui::TextWrapped("%s", v.c_str()); };
+        Row(T("Minecraft", "Minecraft"), ii.ver); Row(T("Загрузчик", "Loader"), ii.loader);
+        Row(T("Нужна Java", "Required Java"), gEdNeedJava > 0 ? std::to_string(gEdNeedJava) : std::string("?"));
+        Row(T("Папка", "Folder"), PS(dir));
+        if (FancyBtn(T("Выбрать для запуска", "Select for launch"), ImVec2(em * 14, em * 1.9f), gAccent)) { cfg.loader = ii.loader; cfg.version = ii.ver; SaveConfig(); close = true; }
+        ImGui::Dummy(ImVec2(0, em * .3f));
+        gCompsT += io.DeltaTime;
+        if (gCompsT > 1.f) {
+            gCompsT = 0; gComps.clear(); std::error_code ec;
+            if (fs::exists(gRoot / "versions" / P(ii.ver) / P(ii.ver + ".json"), ec)) gComps.push_back(ii.ver);
+            if (ii.loader != "Vanilla") for (auto& id : LoaderProfiles(ii.loader, ii.ver)) gComps.push_back(id);
+        }
+        TD(T("Установленные компоненты (патч-файлы)", "Installed components (patch files)"));
+        if (gComps.empty()) TD(T("Пока ничего не установлено — всё скачается при первом запуске.", "Nothing installed yet — everything downloads on first launch."));
+        for (int i = 0; i < (int)gComps.size(); i++) {
+            const std::string id = gComps[i]; ImGui::PushID(i);
+            float aw = ImGui::GetContentRegionAvail().x, rh = em * 2.6f, tw = em * 2.2f; ImVec2 p = ImGui::GetCursorScreenPos();
+            dl->AddRectFilled(p, ImVec2(p.x + aw, p.y + rh), ImGui::GetColorU32(gSoft), R(em * .6f));
+            std::string lab = (id == ii.ver ? std::string("Minecraft  ") : ii.loader + "  ") + id;
+            dl->AddText(ImVec2(p.x + em, p.y + (rh - em) / 2), TextCol(), lab.c_str());
+            ImGui::SetCursorScreenPos(ImVec2(p.x + aw - em * .6f - tw, p.y + (rh - tw) / 2));
+            if (TrashBtn("rm", tw, !gBusy && !gGameRunning && !gDelBusy)) { std::error_code ec; fs::remove_all(gRoot / "versions" / P(id), ec); gCompsT = 99.f; }
+            ImGui::SetCursorScreenPos(p); ImGui::Dummy(ImVec2(aw, rh));
+            ImGui::PopID();
+        }
+        TD(T("Удалённый компонент скачается заново при следующем запуске.", "A removed component is downloaded again on the next launch."));
+    } else if (gEdTab == 2) { // ---- Память ----
+        long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGE_SIZE); int maxMb = std::max(2048, (int)((long long)pages * psz / (1024 * 1024) * 3 / 4));
+        ch |= ImGui::Checkbox(T("Свои настройки памяти для этого экземпляра", "Override memory for this instance"), &gEd.memOv);
+        if (!gEd.memOv) ImGui::TextDisabled(T("Сейчас используется общая настройка: %d МБ (вкладка Java в настройках)", "Global setting in use: %d MB (Java tab in settings)"), cfg.ramMB);
+        ImGui::BeginDisabled(!gEd.memOv);
+        TD(T("Минимум (Xms)", "Minimum (Xms)")); ImGui::SetNextItemWidth(-1); ch |= ImGui::SliderInt("##emin", &gEd.minMB, 128, maxMb, T("%d МБ", "%d MB"));
+        TD(T("Максимум (Xmx)", "Maximum (Xmx)")); ImGui::SetNextItemWidth(-1); ch |= ImGui::SliderInt("##emax", &gEd.maxMB, 256, maxMb, T("%d МБ", "%d MB"));
+        gEd.maxMB = std::min(gEd.maxMB, maxMb); gEd.minMB = std::min(gEd.minMB, gEd.maxMB);
+        ImGui::EndDisabled();
+    } else if (gEdTab == 3) { // ---- Java ----
+        ch |= ImGui::Checkbox(T("Свои настройки Java для этого экземпляра", "Override Java for this instance"), &gEd.javaOv);
+        ImGui::BeginDisabled(!gEd.javaOv);
+        TD("Java"); ImGui::SetNextItemWidth(-1);
+        std::string cur = gEd.javaPath.empty() ? std::string(T("Авто (подберу и скачаю сам)", "Auto (pick and download automatically)")) : gEd.javaPath;
+        if (ImGui::BeginCombo("##ejava", cur.c_str())) {
+            if (ImGui::Selectable(T("Авто (подберу и скачаю сам)", "Auto (pick and download automatically)"), gEd.javaPath.empty())) { gEd.javaPath.clear(); eJava[0] = 0; ch = true; }
+            std::lock_guard<std::mutex> l(gJavaMu);
+            for (auto& j : gJavas) { std::string t = "Java " + std::to_string(j.major) + "  -  " + j.exe; if (ImGui::Selectable(t.c_str(), gEd.javaPath == j.exe)) { gEd.javaPath = j.exe; snprintf(eJava, sizeof(eJava), "%s", j.exe.c_str()); ch = true; } }
+            ImGui::EndCombo();
+        }
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputTextWithHint("##ejp", T("...или свой путь к java", "...or your own path to java"), eJava, sizeof(eJava))) { gEd.javaPath = eJava; ch = true; }
+        TD(T("Аргументы JVM", "JVM arguments")); ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputTextWithHint("##ejvm", "-XX:+UseZGC -Dfile.encoding=UTF-8", eJvm, sizeof(eJvm))) { gEd.jvmArgs = eJvm; ch = true; }
+        ch |= ImGui::Checkbox(T("Пропустить проверку совместимости Java", "Skip Java compatibility check"), &gEd.skipCompat);
+        ImGui::EndDisabled();
+    } else if (gEdTab == 4) { // ---- Minecraft ----
+        ch |= ImGui::Checkbox(T("Свои настройки игры для этого экземпляра", "Override game settings for this instance"), &gEd.mcOv);
+        ImGui::BeginDisabled(!gEd.mcOv);
+        TD(T("Размер окна игры", "Game window size"));
+        ImGui::SetNextItemWidth(em * 8); ch |= ImGui::InputInt("##ew", &gEd.width, 0, 0); ImGui::SameLine(); ImGui::TextUnformatted("x"); ImGui::SameLine();
+        ImGui::SetNextItemWidth(em * 8); ch |= ImGui::InputInt("##eh", &gEd.height, 0, 0);
+        gEd.width = std::clamp(gEd.width, 1, 16384); gEd.height = std::clamp(gEd.height, 1, 16384);
+        ch |= ImGui::Checkbox(T("Запускать в полноэкранном режиме", "Start in fullscreen"), &gEd.fullscreen);
+        ImGui::EndDisabled();
+    } else if (gEdTab == 5) { // ---- Команды ----
+        ch |= ImGui::Checkbox(T("Свои команды для этого экземпляра", "Custom commands for this instance"), &gEd.cmdOv);
+        ImGui::BeginDisabled(!gEd.cmdOv);
+        TD(T("Команда-обёртка (Wrapper), например gamemoderun или mangohud — ставится перед командой запуска Java", "Wrapper command — placed before the Java launch command")); ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##ewrap", eWrap, sizeof(eWrap))) { gEd.wrapper = eWrap; ch = true; }
+        TD(T("Команда перед запуском (игра ждёт её завершения)", "Pre-launch command (the game waits for it)")); ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##epre", ePre, sizeof(ePre))) { gEd.pre = ePre; ch = true; }
+        TD(T("Команда после выхода из игры", "Post-exit command")); ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##epost", ePost, sizeof(ePost))) { gEd.post = ePost; ch = true; }
+        ImGui::EndDisabled();
+        ImGui::PushTextWrapPos(0.f);
+        TD(T("Переменные: $INST_DIR и $INST_MC_DIR (папка экземпляра), $INST_NAME, $INST_ID, $INST_MC_VER, $INST_LOADER, $INST_JAVA., они же доступны как переменные окружения. Команды выполняются через sh -c; пути с пробелами бери в кавычки.",
+              "Variables: $INST_DIR and $INST_MC_DIR (instance folder), $INST_NAME, $INST_ID, $INST_MC_VER, $INST_LOADER, $INST_JAVA., also available as environment variables. Commands run via sh -c; quote paths with spaces."));
+        ImGui::PopTextWrapPos();
+    } else { // ---- Переменные окружения ----
+        ch |= ImGui::Checkbox(T("Свои переменные окружения для этого экземпляра", "Custom environment variables for this instance"), &gEd.envOv);
+        ImGui::BeginDisabled(!gEd.envOv);
+        if (ImGui::InputTextMultiline("##eenv", eEnv, sizeof(eEnv), ImVec2(-1, em * 10))) { gEd.env = eEnv; ch = true; }
+        ImGui::EndDisabled();
+        TD(T("По одной переменной в строке: ИМЯ=значение. Строки с # игнорируются.", "One variable per line: NAME=value. Lines starting with # are ignored."));
+    }
+    ImGui::EndChild();
+    if (ch) SaveInstCfg(dir, gEd);
+    if (!gWorldAsk.empty()) { gWorldDel = gWorldAsk; gWorldAsk.clear(); ImGui::OpenPopup("###wdel"); }
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x / 2, io.DisplaySize.y / 2), ImGuiCond_Always, ImVec2(.5f, .5f));
+    ImGui::SetNextWindowSize(ImVec2(std::min(em * 28, io.DisplaySize.x - em * 2), 0));
+    std::string wid = std::string(T("Удалить мир?", "Delete world?")) + "###wdel";
+    if (ImGui::BeginPopupModal(wid.c_str(), nullptr, ImGuiWindowFlags_NoResize)) {
+        ImGui::PushFont(gFSub); ImGui::TextColored(ImVec4(1.f, .45f, .4f, 1.f), "%s", gWorldDel.c_str()); ImGui::PopFont();
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", T("Мир будет удалён безвозвратно. Если нужна копия — сначала сделай бэкап.", "The world will be deleted permanently. Make a backup first if you want a copy."));
+        ImGui::Dummy(ImVec2(0, em * .5f));
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(.85f, .25f, .25f, .75f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(.90f, .30f, .30f, .90f)); ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(.95f, .35f, .35f, 1.f));
+        bool yes = ImGui::Button(T("Удалить", "Delete"), ImVec2(em * 8, 0));
+        ImGui::PopStyleColor(3); ImGui::SameLine();
+        bool no = ImGui::Button(T("Отмена", "Cancel"), ImVec2(em * 8, 0));
+        if (yes && !gWorldBusy) std::thread(WorldTask, 2, gEdName, gWorldDel, std::string()).detach();
+        if (yes || no) { ImGui::CloseCurrentPopup(); gWorldsT = 99.f; }
+        ImGui::EndPopup();
+    }
+    if (ImGui::Button(T("Закрыть", "Close"), ImVec2(em * 8, 0))) close = true;
+}
+
 // ---------- Настройки ----------
 static void ScrSettings() {
     float em = ImGui::GetFontSize(); ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1590,7 +2073,7 @@ static void ScrSettings() {
         { std::string gd = PS(gRoot); ImGui::TextWrapped("%s", gd.c_str()); }
         if (FancyBtn(T("Выбрать папку игры...", "Choose game folder..."), ImVec2(em * 14, em * 1.9f), gSoft, !gBusy)) { std::string f = PickFolder(nullptr); if (!f.empty()) { SetGameDir(f); ScanShots(); } }
         if (!cfg.gameDir.empty()) { ImGui::SameLine(); if (FancyBtn(T("Вернуть стандартную", "Reset to default"), ImVec2(em * 12, em * 1.9f), gSoft, !gBusy)) { SetGameDir(""); ScanShots(); } }
-        ImGui::Checkbox(T("Моды (бета)", "Mods (beta)"), &cfg.modsOn);
+        ImGui::Checkbox(T("Моды", "Mods"), &cfg.modsOn);
         if (ImGui::Checkbox(T("Логи", "Logs"), &cfg.logsOn)) gLogOn = cfg.logsOn;
         TD(T("Видеокарта", "Graphics card"));
         { const char* it[] = {T("Авто (решает система)", "Auto (system decides)"), T("Использовать дискретную", "Use discrete GPU"), T("Использовать встроенную", "Use integrated GPU")};
@@ -1601,7 +2084,7 @@ static void ScrSettings() {
         { const char* it[] = {"Русский", "English"}; ComboI("##lang", cfg.lang, it, 2); }
         TD(T("После запуска игры", "After the game starts"));
         ImGui::RadioButton(T("Оставить лаунчер как есть", "Leave the launcher as is"), &cfg.onLaunch, 0);
-        ImGui::RadioButton(T("Свернуть лаунчер в фон (значок у часов)", "Hide the launcher to background (tray icon)"), &cfg.onLaunch, 1);
+        ImGui::RadioButton(T("Свернуть лаунчер в фон (значок в трее; если трея нет — просто свернуть)", "Hide the launcher to background (tray icon; minimize if there is no tray)"), &cfg.onLaunch, 1);
         ImGui::RadioButton(T("Закрыть лаунчер", "Close the launcher"), &cfg.onLaunch, 2);
         TD(T("Показывать в списке версий", "Show in the version list"));
         ImGui::Checkbox(T("Снапшоты", "Snapshots"), &cfg.snapshots);
@@ -1675,7 +2158,7 @@ static void ScrSettings() {
         ScanInsts(false);
         static std::string iSel; static int iModal = 0;
         ImDrawList* cdl = ImGui::GetWindowDrawList();
-        TD(T("Все экземпляры. Правая кнопка мыши: информация и настройки.", "All instances. Right-click: information and settings."));
+        TD(T("Все экземпляры. Правая кнопка мыши: информация и изменение экземпляра.", "All instances. Right-click: information and edit instance."));
         if (gInsts.empty()) TD(T("Пока нет ни одного экземпляра. Он появится после первого запуска версии.", "No instances yet. One appears after the first launch of a version."));
         for (int i = 0; i < (int)gInsts.size(); i++) {
             const InstInfo& it = gInsts[i]; ImGui::PushID(i);
@@ -1688,7 +2171,7 @@ static void ScrSettings() {
             cdl->AddText(ImVec2(p.x + aw - ns.x - em, p.y + (rh - ns.y) / 2), TextCol(.45f), it.name.c_str());
             if (ImGui::BeginPopupContextItem("##ictx")) {
                 if (ImGui::Selectable(T("Информация", "Information"))) { iSel = it.name; iModal = 1; }
-                if (ImGui::Selectable(T("Настройки экземпляра", "Instance settings"))) { iSel = it.name; iModal = 2; }
+                if (ImGui::Selectable(T("Изменить экземпляр", "Edit instance"))) { iSel = it.name; iModal = 2; }
                 ImGui::EndPopup();
             }
             ImGui::PopID();
@@ -1696,7 +2179,7 @@ static void ScrSettings() {
         if (iModal == 1) {
             { std::lock_guard<std::mutex> l(gSzMu); gSizes.erase(iSel); if (gSzBusy.insert(iSel).second) std::thread(SizeThread, iSel).detach(); }
             ImGui::OpenPopup("###iinfo"); iModal = 0;
-        } else if (iModal == 2) { ImGui::OpenPopup("###iset"); iModal = 0; }
+        } else if (iModal == 2) { InstEditorOpen(iSel); ImGui::OpenPopup("###iset"); iModal = 0; }
         ImGuiIO& io = ImGui::GetIO();
         auto Center = [&] { ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x / 2, io.DisplaySize.y / 2), ImGuiCond_Always, ImVec2(.5f, .5f)); ImGui::SetNextWindowSize(ImVec2(std::min(em * 30, io.DisplaySize.x - em * 2), 0)); };
         Center();
@@ -1714,14 +2197,11 @@ static void ScrSettings() {
             ImGui::EndPopup();
         }
         Center();
-        std::string t2 = std::string(T("Настройки экземпляра", "Instance settings")) + "###iset";
+        ImGui::SetNextWindowSize(ImVec2(std::min(em * 54, io.DisplaySize.x - em * 2), std::min(em * 36, io.DisplaySize.y - em * 2)));
+        std::string t2 = std::string(T("Изменить экземпляр", "Edit instance")) + "###iset";
         if (ImGui::BeginPopupModal(t2.c_str(), nullptr, ImGuiWindowFlags_NoResize)) {
-            InstInfo ii = ParseInst(iSel);
-            ImGui::PushFont(gFSub); ImGui::TextColored(gAccent, "%s  %s", ii.loader.c_str(), ii.ver.c_str()); ImGui::PopFont();
-            ImGui::Separator();
-            TD(T("Пока здесь пусто. Настройки появятся в следующих версиях.", "Nothing here yet. Settings will appear in future versions."));
-            ImGui::Dummy(ImVec2(0, em * .5f));
-            if (ImGui::Button(T("Закрыть", "Close"), ImVec2(em * 8, 0))) ImGui::CloseCurrentPopup();
+            bool cl = false; InstEditorBody(cl);
+            if (cl) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
     }
@@ -1806,6 +2286,139 @@ static void DrawUI(float W, float H) {
     ImGui::End();
 }
 
+// ============================ Трей (StatusNotifierItem по D-Bus; libdbus подгружается на лету, линковать ничего не нужно) ============================
+// Работает в KDE Plasma, XFCE, Cinnamon, MATE, LXQt, Budgie и в GNOME с расширением «AppIndicator and KStatusNotifierItem Support».
+// Если трея нет (чистый GNOME без расширения) — лаунчер просто сворачивается, чтобы не потерять окно.
+struct DBusConnection; struct DBusMessage;
+struct DbErr { const char* name; const char* message; unsigned int bits; void* pad; };
+struct alignas(8) DbIter { char b[128]; };
+struct DbVTable { void (*unreg)(DBusConnection*, void*); int (*msg)(DBusConnection*, DBusMessage*, void*); void* pad[4]; };
+static DBusConnection* gDbus = nullptr; static bool gDbusTried = false, gTrayOn = false; static std::string gTrayName;
+static DBusConnection* (*p_bus_get)(int, DbErr*);
+static void (*p_err_init)(DbErr*); static int (*p_err_is_set)(const DbErr*); static void (*p_err_free)(DbErr*);
+static void (*p_exit_on_disc)(DBusConnection*, int);
+static int (*p_req_name)(DBusConnection*, const char*, unsigned int, DbErr*);
+static int (*p_rel_name)(DBusConnection*, const char*, DbErr*);
+static int (*p_has_owner)(DBusConnection*, const char*, DbErr*);
+static DBusMessage* (*p_new_call)(const char*, const char*, const char*, const char*);
+static int (*p_append_args)(DBusMessage*, int, ...);
+static DBusMessage* (*p_send_block)(DBusConnection*, DBusMessage*, int, DbErr*);
+static void (*p_msg_unref)(DBusMessage*);
+static int (*p_register_path)(DBusConnection*, const char*, const DbVTable*, void*);
+static int (*p_rw_dispatch)(DBusConnection*, int);
+static DBusMessage* (*p_new_return)(DBusMessage*);
+static int (*p_send)(DBusConnection*, DBusMessage*, unsigned int*);
+static void (*p_iter_init_append)(DBusMessage*, DbIter*);
+static int (*p_iter_append_basic)(DbIter*, int, const void*);
+static int (*p_iter_open)(DbIter*, int, const char*, DbIter*);
+static int (*p_iter_close)(DbIter*, DbIter*);
+static int (*p_iter_fixed_array)(DbIter*, int, const void*, int);
+static int (*p_iter_init)(DBusMessage*, DbIter*);
+static void (*p_iter_get_basic)(DbIter*, void*);
+static int (*p_iter_next)(DbIter*);
+static const char* (*p_get_member)(DBusMessage*);
+static const char* (*p_get_iface)(DBusMessage*);
+static const int kTrayPx = 24;
+static std::vector<unsigned char> gTrayIcon; // ARGB32, как требует StatusNotifierItem
+static void TrayBuildIcon() {
+    gTrayIcon.assign((size_t)kTrayPx * kTrayPx * 4, 0);
+    unsigned char r = (unsigned char)(gAccent.x * 255), g = (unsigned char)(gAccent.y * 255), b = (unsigned char)(gAccent.z * 255);
+    for (int y = 0; y < kTrayPx; y++) for (int x = 0; x < kTrayPx; x++) {
+        float dx = x + .5f - kTrayPx / 2.f, dy = y + .5f - kTrayPx / 2.f, d = sqrtf(dx * dx + dy * dy);
+        float a = std::clamp(kTrayPx / 2.f - 0.5f - d, 0.f, 1.f), w = std::clamp(5.5f - sqrtf(dx * dx + (dy + 1.f) * (dy + 1.f)), 0.f, 1.f); // диск цвета лаунчера + белое «привидение-точка»
+        unsigned char* q = &gTrayIcon[((size_t)y * kTrayPx + x) * 4];
+        q[0] = (unsigned char)(a * 255); q[1] = (unsigned char)(r + (255 - r) * w); q[2] = (unsigned char)(g + (255 - g) * w); q[3] = (unsigned char)(b + (255 - b) * w);
+    }
+}
+static void TrayVarStr(DbIter* par, const char* v) { DbIter var; p_iter_open(par, 'v', "s", &var); p_iter_append_basic(&var, 's', &v); p_iter_close(par, &var); }
+static bool TrayProp(DbIter* par, const std::string& n) { // значение свойства org.kde.StatusNotifierItem внутри variant
+    if (n == "Category") TrayVarStr(par, "ApplicationStatus");
+    else if (n == "Id" || n == "Title") TrayVarStr(par, "PoltergeistLauncher");
+    else if (n == "Status") TrayVarStr(par, "Active");
+    else if (n == "IconName" || n == "OverlayIconName" || n == "AttentionIconName" || n == "IconThemePath") TrayVarStr(par, "");
+    else if (n == "WindowId") { DbIter var; int z = 0; p_iter_open(par, 'v', "i", &var); p_iter_append_basic(&var, 'i', &z); p_iter_close(par, &var); }
+    else if (n == "ItemIsMenu") { DbIter var; unsigned int f = 0; p_iter_open(par, 'v', "b", &var); p_iter_append_basic(&var, 'b', &f); p_iter_close(par, &var); }
+    else if (n == "IconPixmap") {
+        DbIter var, arr, st, ba; int w = kTrayPx, h = kTrayPx; const unsigned char* px = gTrayIcon.data();
+        p_iter_open(par, 'v', "a(iiay)", &var); p_iter_open(&var, 'a', "(iiay)", &arr); p_iter_open(&arr, 'r', nullptr, &st);
+        p_iter_append_basic(&st, 'i', &w); p_iter_append_basic(&st, 'i', &h);
+        p_iter_open(&st, 'a', "y", &ba); p_iter_fixed_array(&ba, 'y', &px, (int)gTrayIcon.size()); p_iter_close(&st, &ba);
+        p_iter_close(&arr, &st); p_iter_close(&var, &arr); p_iter_close(par, &var);
+    } else return false;
+    return true;
+}
+static int TrayHandler(DBusConnection* c, DBusMessage* m, void*) { // 0 = обработано, 1 = не наше
+    const char* ci = p_get_iface(m); const char* cm = p_get_member(m); if (!ci || !cm) return 1;
+    std::string I = ci, M = cm;
+    static const char* kProps[] = {"Category", "Id", "Title", "Status", "WindowId", "IconName", "IconPixmap", "OverlayIconName", "AttentionIconName", "ItemIsMenu"};
+    if (I == "org.kde.StatusNotifierItem") {
+        if (M == "Activate" || M == "SecondaryActivate" || M == "ContextMenu") gWinCmd = 2; // клик по значку — вернуть окно
+        DBusMessage* r = p_new_return(m); if (r) { p_send(c, r, nullptr); p_msg_unref(r); }
+        return 0;
+    }
+    if (I == "org.freedesktop.DBus.Properties") {
+        DBusMessage* r = p_new_return(m); if (!r) return 0;
+        DbIter out; p_iter_init_append(r, &out);
+        if (M == "GetAll") {
+            DbIter dict, ent; p_iter_open(&out, 'a', "{sv}", &dict);
+            for (const char* k : kProps) { p_iter_open(&dict, 'e', nullptr, &ent); p_iter_append_basic(&ent, 's', &k); TrayProp(&ent, k); p_iter_close(&dict, &ent); }
+            p_iter_close(&out, &dict);
+        } else if (M == "Get") {
+            DbIter in; const char* a = nullptr; const char* b = nullptr;
+            if (p_iter_init(m, &in)) { p_iter_get_basic(&in, &a); if (p_iter_next(&in)) p_iter_get_basic(&in, &b); }
+            if (!b || !TrayProp(&out, b)) TrayVarStr(&out, "");
+        }
+        p_send(c, r, nullptr); p_msg_unref(r);
+        return 0;
+    }
+    return 1;
+}
+static bool TrayInit() {
+    if (gDbus) return true; if (gDbusTried) return false; gDbusTried = true;
+    void* lib = dlopen("libdbus-1.so.3", RTLD_LAZY | RTLD_LOCAL); if (!lib) lib = dlopen("libdbus-1.so", RTLD_LAZY | RTLD_LOCAL); if (!lib) return false;
+    bool ok = true;
+    auto ld = [&](auto& fp, const char* n) { fp = reinterpret_cast<std::remove_reference_t<decltype(fp)>>(dlsym(lib, n)); if (!fp) ok = false; };
+    ld(p_bus_get, "dbus_bus_get"); ld(p_err_init, "dbus_error_init"); ld(p_err_is_set, "dbus_error_is_set"); ld(p_err_free, "dbus_error_free");
+    ld(p_exit_on_disc, "dbus_connection_set_exit_on_disconnect"); ld(p_req_name, "dbus_bus_request_name"); ld(p_rel_name, "dbus_bus_release_name"); ld(p_has_owner, "dbus_bus_name_has_owner");
+    ld(p_new_call, "dbus_message_new_method_call"); ld(p_append_args, "dbus_message_append_args"); ld(p_send_block, "dbus_connection_send_with_reply_and_block"); ld(p_msg_unref, "dbus_message_unref");
+    ld(p_register_path, "dbus_connection_register_object_path"); ld(p_rw_dispatch, "dbus_connection_read_write_dispatch"); ld(p_new_return, "dbus_message_new_method_return"); ld(p_send, "dbus_connection_send");
+    ld(p_iter_init_append, "dbus_message_iter_init_append"); ld(p_iter_append_basic, "dbus_message_iter_append_basic"); ld(p_iter_open, "dbus_message_iter_open_container"); ld(p_iter_close, "dbus_message_iter_close_container");
+    ld(p_iter_fixed_array, "dbus_message_iter_append_fixed_array"); ld(p_iter_init, "dbus_message_iter_init"); ld(p_iter_get_basic, "dbus_message_iter_get_basic"); ld(p_iter_next, "dbus_message_iter_next");
+    ld(p_get_member, "dbus_message_get_member"); ld(p_get_iface, "dbus_message_get_interface");
+    if (!ok) return false;
+    DbErr e; p_err_init(&e);
+    DBusConnection* c = p_bus_get(0, &e); // 0 = сессионная шина
+    if (p_err_is_set(&e)) { p_err_free(&e); return false; }
+    if (!c) return false;
+    p_exit_on_disc(c, 0);
+    static const DbVTable vt = {nullptr, TrayHandler, {nullptr, nullptr, nullptr, nullptr}};
+    if (!p_register_path(c, "/StatusNotifierItem", &vt, nullptr)) return false;
+    TrayBuildIcon(); gDbus = c; return true;
+}
+static bool TrayAdd() { // повесить значок в трей; false — трея нет
+    if (gTrayOn) return true;
+    if (!TrayInit()) return false;
+    DbErr e; p_err_init(&e);
+    int has = p_has_owner(gDbus, "org.kde.StatusNotifierWatcher", &e); if (p_err_is_set(&e)) p_err_free(&e);
+    if (!has) return false;
+    gTrayName = "org.kde.StatusNotifierItem-" + std::to_string((long)getpid()) + "-1";
+    p_req_name(gDbus, gTrayName.c_str(), 4 /* DO_NOT_QUEUE */, &e); if (p_err_is_set(&e)) { p_err_free(&e); return false; }
+    DBusMessage* m = p_new_call("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem");
+    if (!m) return false;
+    const char* nm = gTrayName.c_str(); p_append_args(m, 's', &nm, 0);
+    DBusMessage* rep = p_send_block(gDbus, m, 2000, &e); p_msg_unref(m);
+    if (p_err_is_set(&e)) { p_err_free(&e); p_rel_name(gDbus, gTrayName.c_str(), &e); if (p_err_is_set(&e)) p_err_free(&e); return false; }
+    if (rep) p_msg_unref(rep);
+    gTrayOn = true; return true;
+}
+static void TrayDel() { // убрать значок: освобождаем имя на шине — хост трея сам удалит иконку
+    if (!gTrayOn) return; DbErr e; p_err_init(&e);
+    p_rel_name(gDbus, gTrayName.c_str(), &e); if (p_err_is_set(&e)) p_err_free(&e);
+    gTrayOn = false;
+}
+static void TrayPump() { if (gTrayOn && gDbus) p_rw_dispatch(gDbus, 0); }
+static void HideToTray() { if (TrayAdd()) glfwHideWindow(gWin); else glfwIconifyWindow(gWin); } // нет трея — не прячем, а сворачиваем
+
 // ============================ GLFW / OpenGL3 (Linux) ============================
 static void GlfwErr(int c, const char* d) { fprintf(stderr, "GLFW error %d: %s\n", c, d); }
 static std::string ExeDir() { std::error_code ec; fs::path p = fs::read_symlink("/proc/self/exe", ec); return ec ? std::string() : PS(p.parent_path()); }
@@ -1873,10 +2486,10 @@ int main(int, char**) {
 
     bool done = false; auto last = std::chrono::steady_clock::now();
     while (!done) {
-        glfwPollEvents();
-        switch (gWinCmd.exchange(0)) { // команды из потока запуска игры
-            case 1: glfwIconifyWindow(gWin); break;
-            case 2: glfwRestoreWindow(gWin); glfwShowWindow(gWin); glfwFocusWindow(gWin); break;
+        glfwPollEvents(); TrayPump();
+        switch (gWinCmd.exchange(0)) { // команды из потока запуска игры и от значка в трее
+            case 1: HideToTray(); break;
+            case 2: TrayDel(); glfwShowWindow(gWin); glfwRestoreWindow(gWin); glfwFocusWindow(gWin); break;
             case 3: glfwSetWindowShouldClose(gWin, GLFW_TRUE); break;
         }
         if (glfwWindowShouldClose(gWin)) break;
