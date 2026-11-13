@@ -596,6 +596,12 @@ static bool ExtractZipPrefix(const fs::path& zip, const std::string& prefix, con
     }
     mz_zip_reader_end(&z); return found;
 }
+static bool ZipHasEntry(const fs::path& zip, const char* name) {
+    std::string data = ReadAll(zip); mz_zip_archive z{};
+    if (data.empty() || !mz_zip_reader_init_mem(&z, data.data(), data.size(), 0)) return false;
+    bool ok = mz_zip_reader_locate_file(&z, name, nullptr, 0) >= 0;
+    mz_zip_reader_end(&z); return ok;
+}
 // OptiFine: скачиваем jar (зеркало BMCLAPI), прогоняем optifine.Patcher над ванильным клиентом и пишем профиль версии (как делает установщик OptiFine)
 static std::string InstallOptiFine(const std::string& mc, const std::string& javaExe, const json& parent) {
     Status("Устанавливаю OptiFine...");
@@ -615,14 +621,35 @@ static std::string InstallOptiFine(const std::string& mc, const std::string& jav
     std::error_code ec;
     if (fs::exists(gRoot / "versions" / P(id) / P(id + ".json"), ec)) return id;
     fs::path inst = gRoot / "cache" / P("OptiFine_" + full + ".jar");
-    if (!Download("https://bmclapi2.bangbang93.com/optifine/" + mc + "/" + best->type + "/" + best->patch, inst)) throw std::runtime_error("Не скачался OptiFine " + full);
+    fs::create_directories(inst.parent_path(), ec);
+    std::string ofUrl = "https://bmclapi2.bangbang93.com/optifine/" + mc + "/" + best->type + "/" + best->patch;
+    auto fetchOf = [&](bool force) { return Download(ofUrl, inst, force) && ZipHasEntry(inst, "optifine/Patcher.class"); };
+    if (!fetchOf(false) && !fetchOf(true)) { fs::remove(inst, ec); throw std::runtime_error("Не скачался OptiFine " + full + " (файл битый или источник недоступен)"); }
     fs::path base = gRoot / "versions" / P(mc) / P(mc + ".jar");
+    if (!fs::exists(base, ec) || fs::file_size(base, ec) == 0) throw std::runtime_error("Нет ванильного клиента " + mc + " для патча OptiFine");
     fs::path target = gRoot / "libraries" / "optifine" / "OptiFine" / P(full) / P("OptiFine-" + full + ".jar");
     fs::create_directories(target.parent_path(), ec);
-    std::string cap; int code = RunProcess(Q(javaExe) + " -cp " + Q(PS(inst)) + " optifine.Patcher " + Q(PS(base)) + " " + Q(PS(inst)) + " " + Q(PS(target)), gRoot, cap);
-    if (!fs::exists(target, ec) || fs::file_size(target, ec) == 0) {
+    auto runPatch = [&](const std::string& jx, std::string& cap) {
+        fs::remove(target, ec); cap.clear();
+        int c = RunProcess(Q(jx) + " -Djava.awt.headless=true -cp " + Q(PS(inst)) + " optifine.Patcher " + Q(PS(base)) + " " + Q(PS(inst)) + " " + Q(PS(target)), gRoot, cap);
+        return c;
+    };
+    auto patched = [&]() { std::error_code e2; return fs::exists(target, e2) && fs::file_size(target, e2) > 0; };
+    std::string cap; int code = runPatch(javaExe, cap);
+    if (!patched() && cap.find("UnsupportedClassVersionError") != std::string::npos) { // Patcher собран под более новую Java
+        size_t pv = cap.find("class file version "); int need = pv != std::string::npos ? atoi(cap.c_str() + pv + 19) - 44 : 0;
+        if (need < 8) need = 21;
+        std::string j2 = EnsureJava(need);
+        if (!j2.empty()) { j2 = JavaExe(j2); code = runPatch(j2, cap); }
+    }
+    if (!patched()) { // возможно, битый кэш: качаем заново и пробуем ещё раз
+        if (Download(ofUrl, inst, true) && ZipHasEntry(inst, "optifine/Patcher.class")) code = runPatch(javaExe, cap);
+    }
+    if (!patched()) {
         fs::remove(target, ec);
-        throw std::runtime_error("Не удалось применить OptiFine (код " + std::to_string(code) + "). Смотри вкладку «Лог».");
+        std::string tail = cap; while (!tail.empty() && (tail.back() == '\n' || tail.back() == '\r' || tail.back() == ' ')) tail.pop_back();
+        if (tail.size() > 300) tail = tail.substr(tail.size() - 300);
+        throw std::runtime_error("Не удалось применить OptiFine (код " + std::to_string(code) + "). " + tail);
     }
     json libs = json::array(); { json o; o["name"] = "optifine:OptiFine:" + full; libs.push_back(o); }
     std::string lwName, lwData;
@@ -1547,7 +1574,7 @@ static void ModrinthCheckThread() {
 struct NewsItem { const char* ver; const char* ru; const char* en; };
 static int gNewsTab = 0; // 0 новости лаунчера, 1 новости игры
 static const NewsItem kNews[] = { // новые сверху
-    {"v0.0.5", "Все загрузчики (NeoForge, Quilt, OptiFine), выпадающий выбор загрузчика, корзина вместо кнопки «Удалить», полноценные настройки экземпляра: миры, версия, память, Java, команды.", "All loaders (NeoForge, Quilt, OptiFine), dropdown loader picker, trash icon instead of the Delete button, full instance settings: worlds, version, memory, Java, commands."},
+    {"v0.0.5", "Пофикшены некоторые баги, добавлено больше загрузчиков, моды полностью работают, доделаны настройки экземпляра.", "Some bugs fixed, more loaders added, mods fully working, instance settings completed."},
     {"v0.0.4", "Фикс визуала и добавление настроек экземпляра.", "Visual fixes and instance settings added."},
     {"v0.0.3", "Добавлено больше настроек. И моды.", "More settings added. And mods."},
     {"v0.0.2", "Hotfix Java. Скачивалась не та версия для 26.1-26.3.", "Java hotfix. The wrong Java version was downloaded for 26.1-26.3."},
