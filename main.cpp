@@ -29,6 +29,7 @@
 #include <cctype>
 #include <chrono>
 #include <tuple>
+#include <regex>
 #include <dlfcn.h>
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -116,6 +117,10 @@ static std::deque<std::string> gLog;
 static std::string gStatus = "Готов к запуску";
 static std::atomic<float> gProg{0};
 static std::atomic<bool> gBusy{false}, gDelBusy{false};
+static std::atomic<bool> gCancel{false};   // пользователь нажал «Остановить» / «Закрыть»
+static std::atomic<pid_t> gChildPid{0};    // процесс, который сейчас выполняет лаунчер (игра, установщик, патчер)
+struct Cancelled : std::runtime_error { Cancelled() : std::runtime_error("Остановлено") {} };
+static void CheckCancel() { if (gCancel) throw Cancelled(); }
 static bool gShowCrash = false;
 static std::string gCrashTitle, gCrashBody;
 static std::string gMsCode, gMsUri;
@@ -133,11 +138,15 @@ static void ShowError(const std::string& t, const std::string& b) { std::lock_gu
 
 // ============================ HTTP (libcurl) ============================
 struct Resp { int status = 0; std::string body; };
+static thread_local std::string gNetUA; // если не пусто — свой User-Agent (для optifine.net нужен «браузерный»)
+static thread_local std::string gNetErr; static thread_local bool gNetSafe = false; static thread_local long gNetTimeout = 0; // причина последней сетевой ошибки; «безопасный» режим (IPv4 + HTTP/1.1); общий таймаут
 static size_t CurlWrite(char* p, size_t s, size_t n, void* u) { static_cast<std::string*>(u)->append(p, s * n); return s * n; }
+static int CurlProg(void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) { return gCancel ? 1 : 0; } // «Остановить» прерывает любую загрузку
 static Resp Http(const std::string& url, const std::string& method = "GET", const std::string& body = "", const std::string& hdr = "") {
-    Resp r;
-    CURL* c = curl_easy_init(); if (!c) return r;
+    Resp r; gNetErr.clear();
+    CURL* c = curl_easy_init(); if (!c) { gNetErr = "curl_easy_init failed"; return r; }
     std::string ua = std::string("PoltergeistLauncher/") + kVer + " (github.com/PoltergeistTeam/MCL)";
+    if (!gNetUA.empty()) ua = gNetUA;
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_USERAGENT, ua.c_str());
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
@@ -147,6 +156,11 @@ static Resp Http(const std::string& url, const std::string& method = "GET", cons
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);   // «завис» = ни байта за 60 с
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_COOKIEFILE, "");   // включаем cookie-движок (optifine.net выдаёт ссылку и куки вместе)
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, CurlProg);
+    if (gNetSafe) { curl_easy_setopt(c, CURLOPT_IPRESOLVE, (long)CURL_IPRESOLVE_V4); curl_easy_setopt(c, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1); }
+    if (gNetTimeout > 0) curl_easy_setopt(c, CURLOPT_TIMEOUT, gNetTimeout);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, CurlWrite);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
     if (method == "POST") {
@@ -160,8 +174,10 @@ static Resp Http(const std::string& url, const std::string& method = "GET", cons
     curl_slist* hl = nullptr;
     { size_t p = 0; while (p < hdr.size()) { size_t e = hdr.find("\r\n", p); if (e == std::string::npos) e = hdr.size(); if (e > p) hl = curl_slist_append(hl, hdr.substr(p, e - p).c_str()); p = e + 2; } }
     if (hl) curl_easy_setopt(c, CURLOPT_HTTPHEADER, hl);
-    if (curl_easy_perform(c) == CURLE_OK) { long sc = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &sc); r.status = (int)sc; }
-    else r.body.clear();
+    CURLcode rc = curl_easy_perform(c);
+    { char* eu = nullptr; curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &eu); std::string effUrl = eu ? eu : url;
+      if (rc == CURLE_OK) { long sc = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &sc); r.status = (int)sc; if (sc != 200) gNetErr = "HTTP " + std::to_string(sc) + " (" + effUrl + ")"; }
+      else { r.body.clear(); gNetErr = std::string(curl_easy_strerror(rc)) + " (" + effUrl + ")"; } }
     if (hl) curl_slist_free_all(hl);
     curl_easy_cleanup(c);
     return r;
@@ -183,6 +199,7 @@ static bool Download(const std::string& url, const fs::path& dst, bool force = f
     std::error_code ec;
     if (!force && fs::exists(dst, ec) && fs::file_size(dst, ec) > 0) return true;
     for (int i = 0; i < 3; i++) {
+        if (gCancel) return false;
         Resp r = Http(url);
         if (r.status == 200 && !r.body.empty()) { WriteAll(dst, r.body); return true; }
         Sleep(300);
@@ -195,6 +212,7 @@ static void DownloadAll(const std::vector<Job>& jobs, float p0, float p1) { // 8
     std::atomic<size_t> idx{0}, done{0};
     auto worker = [&] {
         for (;;) {
+            if (gCancel) break;
             size_t i = idx++; if (i >= total) break;
             Download(jobs[i].url, jobs[i].dst);
             size_t d = ++done; if (d % 16 == 0 || d == total) gProg = p0 + (p1 - p0) * (float)d / (float)total;
@@ -332,6 +350,84 @@ static std::string NeoMcOf(const std::string& v) { // 21.1.172 -> 1.21.1, 21.0.5
     if (a >= 26) return std::to_string(a) + "." + std::to_string(b);
     return b == 0 ? "1." + std::to_string(a) : "1." + std::to_string(a) + "." + std::to_string(b);
 }
+// ---------- OptiFine: список сборок и скачивание ----------
+struct OfV { std::string type, patch; }; // type: HD_U, HD_U_G..., patch: I6, H5...
+static bool OfBetter(const OfV& a, const OfV& b) { // a новее/лучше b
+    auto key = [](const OfV& o) {
+        bool hdu = o.type == "HD_U", pre = o.patch.rfind("pre", 0) == 0;
+        int letter = (!o.patch.empty() && isalpha((unsigned char)o.patch[0])) ? toupper((unsigned char)o.patch[0]) : 0, num = o.patch.size() > 1 ? atoi(o.patch.c_str() + 1) : 0;
+        return std::make_tuple(hdu, !pre, letter, num);
+    };
+    return key(a) > key(b);
+}
+static std::string OfKey(const OfV& o) { return o.type + "_" + o.patch; }
+static std::string OfLabel(const OfV& o) { std::string r = OfKey(o); for (char& c : r) if (c == '_') c = ' '; return r; }
+static std::string OfFile(const std::string& mc, const OfV& o) { return "OptiFine_" + mc + "_" + o.type + "_" + o.patch + ".jar"; }
+static const char* const kBrowserUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+static const char* const kOfHdr = "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.9\r\n";
+static std::map<std::string, std::vector<OfV>> gOptiBuilds; // версия игры -> сборки OptiFine, лучшие первыми (под gVerMu)
+
+static bool OfParseFile(const std::string& f, std::string& mc, OfV& o) { // OptiFine_1.20.1_HD_U_I6.jar
+    static const std::regex re("^OptiFine_([0-9][0-9.]*)_([A-Za-z_]+?)_([A-Z][0-9]+)\\.jar$");
+    std::smatch m; if (!std::regex_match(f, m, re)) return false;
+    mc = m[1].str(); o.type = m[2].str(); o.patch = m[3].str(); return true;
+}
+static void OfAdd(std::map<std::string, std::vector<OfV>>& out, const std::string& mc, const OfV& o) {
+    auto& v = out[mc]; for (auto& e : v) if (OfKey(e) == OfKey(o)) return; v.push_back(o);
+}
+// Официальный список: страница https://optifine.net/downloads (ссылки вида adloadx?f=OptiFine_1.20.1_HD_U_I6.jar)
+static std::map<std::string, std::vector<OfV>> FetchOptiNet() {
+    std::map<std::string, std::vector<OfV>> out;
+    gNetUA = kBrowserUA;
+    Resp r = Http("https://optifine.net/downloads", "GET", "", std::string(kOfHdr) + "Referer: https://optifine.net/\r\n");
+    gNetUA.clear();
+    if (r.status != 200 || r.body.empty()) return out;
+    for (const char* key : {"adloadx?f=", "downloadx?f=", "download?f="}) {
+        std::string k = key; size_t p = 0;
+        while ((p = r.body.find(k, p)) != std::string::npos) {
+            size_t b = p + k.size(), e = b;
+            while (e < r.body.size() && std::string("\"'&<> \\\r\n").find(r.body[e]) == std::string::npos) e++;
+            std::string f = r.body.substr(b, e - b); p = e;
+            std::string mc; OfV o; if (OfParseFile(f, mc, o)) OfAdd(out, mc, o);
+        }
+    }
+    return out;
+}
+// Основной источник — optifine.net; зеркало BMCLAPI добавляет то, чего нет на сайте (или работает, если сайт недоступен)
+static std::map<std::string, std::vector<OfV>> FetchOptiAll() {
+    std::map<std::string, std::vector<OfV>> out = FetchOptiNet();
+    Resp r = Http("https://bmclapi2.bangbang93.com/optifine/versionList"); json j = Parse(r.body);
+    if (j.is_array()) for (auto& x : j) {
+        if (!x.is_object() || !x.contains("mcversion") || !x["mcversion"].is_string()) continue;
+        std::string mc = x["mcversion"].get<std::string>(); out[mc]; // версия игры есть в списке, даже если сборки не разобрались
+        if (x.contains("type") && x.contains("patch") && x["type"].is_string() && x["patch"].is_string()) {
+            OfV o{x["type"].get<std::string>(), x["patch"].get<std::string>()};
+            if (!o.type.empty() && !o.patch.empty()) OfAdd(out, mc, o);
+        }
+    }
+    for (auto& kv : out) std::sort(kv.second.begin(), kv.second.end(), [](const OfV& a, const OfV& b) { return OfBetter(a, b); });
+    return out;
+}
+// Скачивание с optifine.net: страница adloadx содержит ссылку downloadx?f=...&x=<токен>, по ней отдаётся сам jar
+static Resp OfHttpOfficial(const std::string& file, std::string& why) {
+    Resp out; why.clear();
+    gNetUA = kBrowserUA;
+    std::string page = "https://optifine.net/adloadx?f=" + file;
+    Resp pg = Http(page, "GET", "", std::string(kOfHdr) + "Referer: https://optifine.net/downloads\r\n");
+    if (pg.status == 200 && !pg.body.empty()) {
+        std::string href; size_t p = pg.body.find("downloadx?f=");
+        if (p != std::string::npos) {
+            size_t e = p; while (e < pg.body.size() && std::string("\"'<> \r\n").find(pg.body[e]) == std::string::npos) e++;
+            href = pg.body.substr(p, e - p);
+            for (size_t q; (q = href.find("&amp;")) != std::string::npos;) href.replace(q, 5, "&");
+        }
+        if (!href.empty()) out = Http(href.rfind("http", 0) == 0 ? href : "https://optifine.net/" + href, "GET", "", std::string(kOfHdr) + "Referer: " + page + "\r\n");
+        else why = "на странице optifine.net нет ссылки на загрузку";
+    } else { out.status = pg.status; why = gNetErr; }
+    gNetUA.clear();
+    return out;
+}
+
 static std::set<std::string> gQuiltGames, gNeoGames, gOptiGames;
 static std::set<std::string> gFabricGames, gForgeGames; // какие версии поддерживают загрузчики (пусто = не удалось получить, показываем все)
 static void FetchLoaderLists() {
@@ -347,9 +443,8 @@ static void FetchLoaderLists() {
     r = Http("https://meta.quiltmc.org/v3/versions/game"); j = Parse(r.body);
     if (j.is_array()) for (auto& x : j) if (x.is_object() && x.contains("version") && x["version"].is_string()) quilt.insert(x["version"].get<std::string>());
     for (auto& v : NeoVersions()) { std::string m = NeoMcOf(v); if (!m.empty()) neo.insert(m); }
-    r = Http("https://bmclapi2.bangbang93.com/optifine/versionList"); j = Parse(r.body);
-    if (j.is_array()) for (auto& x : j) if (x.is_object() && x.contains("mcversion") && x["mcversion"].is_string()) opti.insert(x["mcversion"].get<std::string>());
-    std::lock_guard<std::mutex> l(gVerMu); gFabricGames = fab; gForgeGames = forge; gQuiltGames = quilt; gNeoGames = neo; gOptiGames = opti;
+    auto ob = FetchOptiAll(); for (auto& kv : ob) opti.insert(kv.first);
+    std::lock_guard<std::mutex> l(gVerMu); gFabricGames = fab; gForgeGames = forge; gQuiltGames = quilt; gNeoGames = neo; gOptiGames = opti; if (!ob.empty()) gOptiBuilds = ob;
 }
 static bool RuleOk(const json& rules) {
     if (!rules.is_array() || rules.empty()) return true;
@@ -436,7 +531,7 @@ static void Prepare(const json& v, const std::string& launchId, const fs::path& 
         }
     }
     Status("Скачиваю библиотеки: " + std::to_string(jobs.size()) + " файлов");
-    DownloadAll(jobs, 0.05f, 0.3f);
+    DownloadAll(jobs, 0.05f, 0.3f); CheckCancel();
     o.natives = gRoot / "versions" / P(launchId) / "natives";
     std::error_code ec; fs::create_directories(o.natives, ec);
     for (auto& nj : nativeJars) Unzip(nj, o.natives, true);
@@ -456,7 +551,7 @@ static void Prepare(const json& v, const std::string& launchId, const fs::path& 
             if (!fs::exists(d, ec)) aj.push_back({"https://resources.download.minecraft.net/" + h.substr(0, 2) + "/" + h, d});
         }
         Status("Скачиваю ресурсы игры: " + std::to_string(aj.size()) + " файлов");
-        DownloadAll(aj, 0.3f, 0.95f);
+        DownloadAll(aj, 0.3f, 0.95f); CheckCancel();
         if (virt || mapRes) {
             fs::path dir = virt ? gRoot / "assets" / "virtual" / "legacy" : gameDir / "resources";
             for (auto it = idx["objects"].begin(); it != idx["objects"].end(); ++it) {
@@ -572,15 +667,6 @@ static std::string InstallQuilt(const std::string& mc) {
     WriteAll(gRoot / "versions" / P(id) / P(id + ".json"), r.body);
     return id;
 }
-struct OfV { std::string type, patch; };
-static bool OfBetter(const OfV& a, const OfV& b) { // a новее/лучше b
-    auto key = [](const OfV& o) {
-        bool hdu = o.type == "HD_U", pre = o.patch.rfind("pre", 0) == 0;
-        int letter = (!o.patch.empty() && isalpha((unsigned char)o.patch[0])) ? toupper((unsigned char)o.patch[0]) : 0, num = o.patch.size() > 1 ? atoi(o.patch.c_str() + 1) : 0;
-        return std::make_tuple(hdu, !pre, letter, num);
-    };
-    return key(a) > key(b);
-}
 static bool ExtractZipPrefix(const fs::path& zip, const std::string& prefix, const std::string& suffix, std::string& outName, std::string& outData) {
     std::string data = ReadAll(zip); mz_zip_archive z{};
     if (data.empty() || !mz_zip_reader_init_mem(&z, data.data(), data.size(), 0)) return false;
@@ -602,29 +688,67 @@ static bool ZipHasEntry(const fs::path& zip, const char* name) {
     bool ok = mz_zip_reader_locate_file(&z, name, nullptr, 0) >= 0;
     mz_zip_reader_end(&z); return ok;
 }
-// OptiFine: скачиваем jar (зеркало BMCLAPI), прогоняем optifine.Patcher над ванильным клиентом и пишем профиль версии (как делает установщик OptiFine)
-static std::string InstallOptiFine(const std::string& mc, const std::string& javaExe, const json& parent) {
+// OptiFine: скачиваем jar с optifine.net (запасной вариант — зеркало BMCLAPI), прогоняем optifine.Patcher над ванильным клиентом и пишем профиль версии (как делает установщик OptiFine)
+// want — выбранная сборка ("HD_U_I6"); пусто = автоматически лучшая
+static std::string InstallOptiFine(const std::string& mc, const std::string& javaExe, const json& parent, const std::string& want = "") {
     Status("Устанавливаю OptiFine...");
-    Resp r = Http("https://bmclapi2.bangbang93.com/optifine/" + mc); json j = Parse(r.body);
-    std::optional<OfV> best;
-    if (j.is_array()) for (auto& x : j) {
-        if (!x.is_object() || !x.contains("type") || !x.contains("patch") || !x["type"].is_string() || !x["patch"].is_string()) continue;
-        OfV o{x["type"].get<std::string>(), x["patch"].get<std::string>()};
-        if (o.type.empty() || o.patch.empty()) continue;
-        if (!best || OfBetter(o, *best)) best = o;
+    std::vector<OfV> cands;
+    { std::lock_guard<std::mutex> l(gVerMu); auto it = gOptiBuilds.find(mc); if (it != gOptiBuilds.end()) cands = it->second; }
+    if (cands.empty()) { // список ещё не загрузился или раньше не было сети
+        auto ob = FetchOptiAll();
+        { std::lock_guard<std::mutex> l(gVerMu); if (!ob.empty()) gOptiBuilds = ob; }
+        auto it = ob.find(mc); if (it != ob.end()) cands = it->second;
     }
-    if (!best) {
+    if (cands.empty()) { // последний шанс: прямой запрос к зеркалу по версии игры
+        Resp r = Http("https://bmclapi2.bangbang93.com/optifine/" + mc); json j = Parse(r.body);
+        if (j.is_array()) for (auto& x : j) {
+            if (!x.is_object() || !x.contains("type") || !x.contains("patch") || !x["type"].is_string() || !x["patch"].is_string()) continue;
+            OfV o{x["type"].get<std::string>(), x["patch"].get<std::string>()};
+            if (!o.type.empty() && !o.patch.empty()) cands.push_back(o);
+        }
+    }
+    CheckCancel();
+    std::sort(cands.begin(), cands.end(), [](const OfV& x, const OfV& y) { return OfBetter(x, y); }); // лучшие первыми
+    if (!want.empty()) { std::vector<OfV> w; for (auto& c : cands) if (OfKey(c) == want) w.push_back(c); if (!w.empty()) cands = w; } // выбрана конкретная сборка
+    if (cands.empty()) {
         auto have = LoaderProfiles("OptiFine", mc); if (!have.empty()) return have[0];
-        throw std::runtime_error(r.status == 0 ? "Нет соединения с источником OptiFine (интернет / VPN / фаервол)" : "Для Minecraft " + mc + " нет OptiFine");
+        throw std::runtime_error("Не получил список OptiFine для Minecraft " + mc + " (интернет / VPN / фаервол) или для этой версии OptiFine нет");
     }
-    std::string full = mc + "_" + best->type + "_" + best->patch, id = mc + "-OptiFine_" + best->type + "_" + best->patch;
     std::error_code ec;
-    if (fs::exists(gRoot / "versions" / P(id) / P(id + ".json"), ec)) return id;
-    fs::path inst = gRoot / "cache" / P("OptiFine_" + full + ".jar");
-    fs::create_directories(inst.parent_path(), ec);
-    std::string ofUrl = "https://bmclapi2.bangbang93.com/optifine/" + mc + "/" + best->type + "/" + best->patch;
-    auto fetchOf = [&](bool force) { return Download(ofUrl, inst, force) && ZipHasEntry(inst, "optifine/Patcher.class"); };
-    if (!fetchOf(false) && !fetchOf(true)) { fs::remove(inst, ec); throw std::runtime_error("Не скачался OptiFine " + full + " (файл битый или источник недоступен)"); }
+    for (auto& c : cands) { std::string idc = mc + "-OptiFine_" + c.type + "_" + c.patch; if (fs::exists(gRoot / "versions" / P(idc) / P(idc + ".json"), ec)) return idc; }
+    std::optional<OfV> best; std::string full, id, ofUrl, netWhy, curFile; fs::path inst;
+    auto fetchOf = [&](bool force) {
+        if (!force && fs::exists(inst, ec) && fs::file_size(inst, ec) > 0 && ZipHasEntry(inst, "optifine/Patcher.class")) return true;
+        for (int a = 0; a < 4; a++) { // попытки 0-1: optifine.net, 2-3: зеркало BMCLAPI
+            CheckCancel();
+            bool official = a < 2; int tryNo = a % 2 + 1; const char* src = official ? "optifine.net" : "зеркало";
+            Status("Скачиваю OptiFine " + full + " (" + src + ", попытка " + std::to_string(tryNo) + "/2)...");
+            gNetSafe = tryNo > 1; gNetTimeout = 120;
+            std::string why; Resp rr = official ? OfHttpOfficial(curFile, why) : Http(ofUrl);
+            gNetSafe = false; gNetTimeout = 0;
+            if (rr.status == 200 && !rr.body.empty()) {
+                WriteAll(inst, rr.body);
+                if (ZipHasEntry(inst, "optifine/Patcher.class")) return true;
+                std::string head = rr.body.substr(0, 60); for (char& ch : head) if ((unsigned char)ch < 32 || (unsigned char)ch > 126) ch = '.';
+                netWhy = std::string(src) + ": ответ не похож на jar (" + std::to_string(rr.body.size()) + " байт: " + head + ")";
+            } else netWhy = std::string(src) + ": " + (!why.empty() ? why : gNetErr.empty() ? ("HTTP " + std::to_string(rr.status)) : gNetErr);
+            if (rr.status == 404) { if (official) { a = 1; continue; } break; } // на сайте нет — сразу на зеркало; на зеркале нет — дальше повторять бессмысленно
+            Sleep(500);
+        }
+        return false;
+    };
+    { // перебираем сборки от лучшей к худшей, пока какая-то не скачается
+        std::string allWhy; int tried = 0;
+        for (auto& c : cands) {
+            if (tried++ >= 8) break;
+            full = mc + "_" + c.type + "_" + c.patch; id = mc + "-OptiFine_" + c.type + "_" + c.patch; curFile = OfFile(mc, c);
+            ofUrl = "https://bmclapi2.bangbang93.com/optifine/" + mc + "/" + c.type + "/" + c.patch;
+            inst = gRoot / "cache" / P("OptiFine_" + full + ".jar"); fs::create_directories(inst.parent_path(), ec);
+            if (fetchOf(false)) { best = c; break; }
+            fs::remove(inst, ec); allWhy += (allWhy.empty() ? "" : "; ") + c.type + "_" + c.patch + ": " + netWhy;
+        }
+        if (!best) throw std::runtime_error("Не скачался OptiFine для " + mc + " (" + allWhy + ")");
+    }
     fs::path base = gRoot / "versions" / P(mc) / P(mc + ".jar");
     if (!fs::exists(base, ec) || fs::file_size(base, ec) == 0) throw std::runtime_error("Нет ванильного клиента " + mc + " для патча OptiFine");
     fs::path target = gRoot / "libraries" / "optifine" / "OptiFine" / P(full) / P("OptiFine-" + full + ".jar");
@@ -635,15 +759,16 @@ static std::string InstallOptiFine(const std::string& mc, const std::string& jav
         return c;
     };
     auto patched = [&]() { std::error_code e2; return fs::exists(target, e2) && fs::file_size(target, e2) > 0; };
-    std::string cap; int code = runPatch(javaExe, cap);
+    std::string cap; int code = runPatch(javaExe, cap); CheckCancel();
     if (!patched() && cap.find("UnsupportedClassVersionError") != std::string::npos) { // Patcher собран под более новую Java
         size_t pv = cap.find("class file version "); int need = pv != std::string::npos ? atoi(cap.c_str() + pv + 19) - 44 : 0;
         if (need < 8) need = 21;
         std::string j2 = EnsureJava(need);
         if (!j2.empty()) { j2 = JavaExe(j2); code = runPatch(j2, cap); }
     }
+    CheckCancel();
     if (!patched()) { // возможно, битый кэш: качаем заново и пробуем ещё раз
-        if (Download(ofUrl, inst, true) && ZipHasEntry(inst, "optifine/Patcher.class")) code = runPatch(javaExe, cap);
+        if (fetchOf(true)) code = runPatch(javaExe, cap);
     }
     if (!patched()) {
         fs::remove(target, ec);
@@ -711,6 +836,7 @@ static int RunProcess(const std::string& cmd, const fs::path& cwd, std::string& 
     pid_t pid = fork();
     if (pid < 0) { close(pfd[0]); close(pfd[1]); captured = "fork failed"; return -1; }
     if (pid == 0) {
+        setpgid(0, 0); // своя группа процессов: «Остановить/Закрыть» убивает и обёртки (gamemoderun и т.п.)
         dup2(pfd[1], 1); dup2(pfd[1], 2);
         int dn = open("/dev/null", O_RDONLY); if (dn >= 0) { dup2(dn, 0); if (dn > 2) close(dn); }
         if (!cwdS.empty() && chdir(cwdS.c_str()) != 0) { /* остаёмся в текущей папке */ }
@@ -719,6 +845,7 @@ static int RunProcess(const std::string& cmd, const fs::path& cwd, std::string& 
         _exit(127);
     }
     close(pfd[1]);
+    setpgid(pid, pid); gChildPid = pid; if (gCancel) kill(-pid, SIGTERM);
     std::string part; char buf[4096]; ssize_t n;
     for (;;) {
         n = read(pfd[0], buf, sizeof(buf));
@@ -734,6 +861,7 @@ static int RunProcess(const std::string& cmd, const fs::path& cwd, std::string& 
     if (!part.empty()) { Log(part); captured += part; }
     close(pfd[0]);
     int st = 0; while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    gChildPid = 0;
     if (WIFEXITED(st)) return WEXITSTATUS(st);
     if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
     return -1;
@@ -921,6 +1049,7 @@ static void ElyLoginThread(std::string u, std::string p) {
 // ============================ Конфиг ============================
 struct Config {
     std::string loader = "Vanilla", version, javaPath, bg, shotsDir;
+    std::string optiBuild; // выбранная сборка OptiFine ("HD_U_I6"), пусто = автоматически лучшая
     std::string gameDir; // пусто = стандартная
     bool snapshots = false, showBeta = false, showAlpha = false, slideshow = true;
     int ramMB = 4096, sel = -1, onLaunch = 0; // onLaunch: 0 оставить, 1 свернуть, 2 закрыть
@@ -933,7 +1062,7 @@ static Config cfg;
 static void SaveConfig() {
     json j; j["loader"] = cfg.loader; j["version"] = cfg.version; j["java"] = cfg.javaPath; j["bg"] = cfg.bg; j["shots"] = cfg.shotsDir;
     j["snap"] = cfg.snapshots; j["slide"] = cfg.slideshow; j["ram"] = cfg.ramMB; j["sel"] = cfg.sel; j["msid"] = MsId(); j["gamedir"] = cfg.gameDir; j["beta"] = cfg.showBeta; j["alpha"] = cfg.showAlpha; j["onlaunch"] = cfg.onLaunch;
-    j["lang"] = cfg.lang; j["color"] = cfg.color; j["gpu"] = cfg.gpu; j["light"] = cfg.light; j["round"] = cfg.rounded; j["mods"] = cfg.modsOn; j["logs"] = cfg.logsOn; j["jvm"] = cfg.jvmArgs;
+    j["lang"] = cfg.lang; j["color"] = cfg.color; j["gpu"] = cfg.gpu; j["light"] = cfg.light; j["round"] = cfg.rounded; j["mods"] = cfg.modsOn; j["logs"] = cfg.logsOn; j["jvm"] = cfg.jvmArgs; j["ofbuild"] = cfg.optiBuild;
     for (auto& a : cfg.accs) j["accs"].push_back({{"type", a.type}, {"name", a.name}, {"uuid", a.uuid}, {"token", a.token}, {"refresh", a.refresh}});
     WriteAll(gCfgDir / "config.json", j.dump(2));
 }
@@ -945,7 +1074,7 @@ static void LoadConfig() {
         { std::string id = j.value("msid", ""); if (!id.empty()) SetMsId(id); }
         cfg.gameDir = j.value("gamedir", ""); cfg.showBeta = j.value("beta", false); cfg.showAlpha = j.value("alpha", false); cfg.onLaunch = j.value("onlaunch", 0);
         cfg.lang = j.value("lang", 0); cfg.color = j.value("color", 1); cfg.gpu = j.value("gpu", 0); cfg.light = j.value("light", false); cfg.rounded = j.value("round", true);
-        cfg.modsOn = j.value("mods", true); cfg.logsOn = j.value("logs", true); cfg.jvmArgs = j.value("jvm", "");
+        cfg.modsOn = j.value("mods", true); cfg.logsOn = j.value("logs", true); cfg.jvmArgs = j.value("jvm", ""); cfg.optiBuild = j.value("ofbuild", "");
         if (j.contains("accs")) for (auto& a : j["accs"]) cfg.accs.push_back({a.value("type", 0), a.value("name", ""), a.value("uuid", ""), a.value("token", ""), a.value("refresh", "")});
     } catch (...) {}
 }
@@ -1059,7 +1188,8 @@ static void LaunchThread(Config c, Account acc) {
         else if (c.loader == "Forge") launchId = InstallForge(c.version, javaPick);
         else if (c.loader == "NeoForge") launchId = InstallNeoForge(c.version, javaPick);
         else if (c.loader == "Quilt") launchId = InstallQuilt(c.version);
-        else if (c.loader == "OptiFine") launchId = InstallOptiFine(c.version, javaPick, v);
+        else if (c.loader == "OptiFine") launchId = InstallOptiFine(c.version, javaPick, v, c.optiBuild);
+        CheckCancel();
         if (launchId.empty()) throw std::runtime_error("Не удалось установить " + c.loader);
         json lv = launchId == c.version ? v : LoadVersionJson(launchId);
         if (lv.is_null()) throw std::runtime_error("Не нашёл описание профиля " + launchId);
@@ -1070,7 +1200,7 @@ static void LaunchThread(Config c, Account acc) {
             int jm = JavaMajorFromHome(P(java).parent_path().parent_path());
             if (jm > 0 && jm < need2) throw std::runtime_error("Выбранная Java " + std::to_string(jm) + " слишком старая: для " + launchId + " нужна Java " + std::to_string(need2) + ". Выбери другую Java или включи «Пропустить проверку совместимости» в настройках экземпляра.");
         }
-        Prep pp; Prepare(lv, launchId, gameDir, pp);
+        Prep pp; Prepare(lv, launchId, gameDir, pp); CheckCancel();
         std::error_code ec; fs::create_directories(gameDir, ec); // экземпляр «установлен» только после успешной подготовки
 
         std::map<std::string, std::string> vars = {
@@ -1129,6 +1259,7 @@ static void LaunchThread(Config c, Account acc) {
             if (pcode != 0) throw std::runtime_error("Команда перед запуском завершилась с кодом " + std::to_string(pcode) + ", игра не запущена.");
         }
 
+        CheckCancel();
         gProg = 1.0f; Status("Игра запущена (" + launchId + ")");
         gGameRunning = true; int act = c.onLaunch;
         if (act == 1 || act == 2) std::thread([act] { // свернуть/закрыть лаунчер, если игра успешно стартовала и не упала
@@ -1141,12 +1272,25 @@ static void LaunchThread(Config c, Account acc) {
         if (ic.cmdOv && !ic.post.empty()) { std::string pc2; RunProcess("/bin/sh -c " + Q(sd(ic.post)), gameDir, pc2); }
         if (act == 1) gWinCmd = 2; // игра закрылась - вернуть лаунчер из фона
         if (gLogOn) WriteAll(gCfgDir / "latest.log", cap);
-        if (code != 0) { auto [t, b] = Analyze(code, cap); Status("Игра завершилась с ошибкой: " + t); ShowError(t, b); }
+        if (gCancel) Status("Игра закрыта"); // закрыта кнопкой «Закрыть» — это не крэш
+        else if (code != 0) { auto [t, b] = Analyze(code, cap); Status("Игра завершилась с ошибкой: " + t); ShowError(t, b); }
         else Status("Игра закрыта");
     } catch (std::exception& e) {
-        Status(std::string("Ошибка: ") + e.what()); ShowError("Не удалось запустить", e.what());
+        if (gCancel) { gProg = 0; Status("Остановлено"); }
+        else { Status(std::string("Ошибка: ") + e.what()); ShowError("Не удалось запустить", e.what()); }
     }
-    gBusy = false;
+    gGameRunning = false; gCancel = false; gBusy = false;
+}
+// Кнопка «Остановить» (идёт загрузка/установка) и «Закрыть» (игра уже запущена)
+static void StopLaunch() {
+    if (!gBusy || gCancel) return;
+    gCancel = true;
+    Status(gGameRunning ? "Закрываю игру..." : "Останавливаю...");
+    pid_t p = gChildPid; if (p > 0) kill(-p, SIGTERM);
+    std::thread([p] { // если процесс не завершился сам за ~8 секунд — добиваем
+        for (int i = 0; i < 80 && gChildPid == p && p > 0; i++) Sleep(100);
+        if (p > 0 && gChildPid == p) kill(-p, SIGKILL);
+    }).detach();
 }
 static bool AddOffline(const std::string& name) {
     if (!ValidNick(name)) { AuthMsg(kNickHint); return false; }
@@ -1159,6 +1303,7 @@ static void StartLaunch() {
     if (cfg.accs.empty() && !AddOffline(bNick)) return; // нет аккаунтов - играем офлайн с ником из поля ввода
     if (cfg.sel < 0 || cfg.sel >= (int)cfg.accs.size()) cfg.sel = 0;
     SaveConfig();
+    gCancel = false;
     std::thread(LaunchThread, cfg, cfg.accs[cfg.sel]).detach();
 }
 
@@ -1599,6 +1744,28 @@ static bool ComboI(const char* id, int& cur, const char* const* items, int n) {
 }
 
 // ---------- Главный экран ----------
+static bool sOfAsk = false; // после выбора версии OptiFine предлагаем выбрать сборку
+// Выбор сборки OptiFine для версии игры mc: «Авто» + все сборки (лучшая первой). Возвращает true, если пользователь что-то выбрал.
+static bool OfBuildItems(const std::string& mc) {
+    std::vector<OfV> bl; { std::lock_guard<std::mutex> l(gVerMu); auto it = gOptiBuilds.find(mc); if (it != gOptiBuilds.end()) bl = it->second; }
+    bool picked = false;
+    if (ImGui::Selectable(T("Авто (лучшая сборка)", "Auto (best build)"), cfg.optiBuild.empty())) { cfg.optiBuild.clear(); picked = true; }
+    for (size_t i = 0; i < bl.size(); i++) {
+        ImGui::PushID((int)i);
+        std::string lab = OfLabel(bl[i]) + (i == 0 ? T("   [новейшая]", "   [latest]") : "");
+        if (ImGui::Selectable(lab.c_str(), OfKey(bl[i]) == cfg.optiBuild)) { cfg.optiBuild = OfKey(bl[i]); picked = true; }
+        ImGui::PopID();
+    }
+    if (bl.empty()) ImGui::TextDisabled("%s", T("Список сборок ещё загружается...", "Build list is still loading..."));
+    return picked;
+}
+static std::string OfBuildCaption(const std::string& mc) {
+    if (cfg.optiBuild.empty()) return T("Авто (лучшая сборка)", "Auto (best build)");
+    std::lock_guard<std::mutex> l(gVerMu); auto it = gOptiBuilds.find(mc);
+    if (it != gOptiBuilds.end()) for (auto& b : it->second) if (OfKey(b) == cfg.optiBuild) return OfLabel(b);
+    return cfg.optiBuild;
+}
+
 static void ScrMain() {
     float em = ImGui::GetFontSize(); ImGuiStyle& sty = ImGui::GetStyle(); ImDrawList* dl = ImGui::GetWindowDrawList();
     { // шапка: название слева, версия и «Настройки» справа
@@ -1694,11 +1861,15 @@ static void ScrMain() {
                 if (ImGui::BeginCombo("##ldr", cfg.loader.c_str())) {
                     for (int i = 0; i < kNLoaders; i++) {
                         bool sel = cfg.loader == kLoaders[i];
-                        if (ImGui::Selectable(kLoaders[i], sel) && !sel) { cfg.loader = kLoaders[i]; fixVer(); }
+                        if (ImGui::Selectable(kLoaders[i], sel) && !sel) { cfg.loader = kLoaders[i]; cfg.optiBuild.clear(); fixVer(); }
                         if (sel) ImGui::SetItemDefaultFocus();
                     }
                     ImGui::EndCombo();
                 }
+            }
+            if (cfg.loader == "OptiFine") { // сборка OptiFine для выбранной версии игры
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo("##ofb", (std::string(T("Сборка: ", "Build: ")) + OfBuildCaption(cfg.version)).c_str())) { if (OfBuildItems(cfg.version)) ImGui::CloseCurrentPopup(); ImGui::EndCombo(); }
             }
             ImGui::Separator();
             ImGui::BeginChild("##vlist", ImVec2(0, 0), false);
@@ -1717,16 +1888,37 @@ static void ScrMain() {
                         DrawTrash(ImGui::GetWindowDrawList(), ta, tb, hovT, !off);
                         if (clicked && hovT) { clicked = false; if (!off) { gDelAsk = DelReq{cfg.loader, v.id}; ImGui::CloseCurrentPopup(); } }
                     }
-                    if (clicked) { cfg.version = v.id; ImGui::CloseCurrentPopup(); }
+                    if (clicked) { if (cfg.version != v.id) cfg.optiBuild.clear(); cfg.version = v.id; ImGui::CloseCurrentPopup(); if (cfg.loader == "OptiFine") sOfAsk = true; }
                     ImGui::PopID();
                 }
             }
             ImGui::EndChild();
             ImGui::EndPopup();
         }
+        if (sOfAsk) { // выбрали версию игры с загрузчиком OptiFine — предлагаем выбрать сборку OptiFine (если их несколько)
+            sOfAsk = false; size_t nb = 0; { std::lock_guard<std::mutex> l(gVerMu); auto it = gOptiBuilds.find(cfg.version); if (it != gOptiBuilds.end()) nb = it->second.size(); }
+            if (nb > 1) ImGui::OpenPopup("##ofpick");
+        }
+        ImGui::SetNextWindowPos(ImVec2(bmin.x, bmin.y - 4), 0, ImVec2(0, 1));
+        ImGui::SetNextWindowSize(ImVec2(std::max(bmax.x - bmin.x, em * 16.f), std::max(em * 6.f, std::min(em * 15.f, bmin.y - em))));
+        if (ImGui::BeginPopup("##ofpick")) {
+            ImGui::TextColored(gAccent, "OptiFine %s", cfg.version.c_str());
+            ImGui::TextDisabled("%s", T("Выбери сборку OptiFine", "Pick an OptiFine build"));
+            ImGui::Separator();
+            ImGui::BeginChild("##oflist", ImVec2(0, 0), false);
+            if (OfBuildItems(cfg.version)) ImGui::CloseCurrentPopup();
+            ImGui::EndChild();
+            ImGui::EndPopup();
+        }
     }
     ImGui::SameLine();
-    if (FancyBtn(busy ? T("Работаю...", "Working...") : T("ИГРАТЬ", "PLAY"), ImVec2(wc, bh), gAccent, !busy && !gDelBusy && !cfg.version.empty())) StartLaunch();
+    if (busy) { // идёт загрузка/запуск: слева статус, справа «Остановить» (или «Закрыть», когда игра уже запущена)
+        bool run = gGameRunning, req = gCancel;
+        float sw = std::max(em * 7.f, wc * 0.40f), pw = wc - sw - sp;
+        FancyBtn(run ? T("Игра запущена", "Game running") : T("Работаю...", "Working..."), ImVec2(pw, bh), gAccent, false);
+        ImGui::SameLine();
+        if (FancyBtn(req ? T("Останавливаю...", "Stopping...") : run ? T("Закрыть", "Close") : T("Остановить", "Stop"), ImVec2(sw, bh), ImVec4(0.80f, 0.27f, 0.27f, 1.f), !req)) StopLaunch();
+    } else if (FancyBtn(T("ИГРАТЬ", "PLAY"), ImVec2(wc, bh), gAccent, !gDelBusy && !cfg.version.empty())) StartLaunch();
     ImGui::SameLine();
     std::string al = (cfg.sel >= 0 && cfg.sel < (int)cfg.accs.size()) ? cfg.accs[cfg.sel].name : std::string(T("Добавить аккаунт", "Add account"));
     if (FancyBtn(al.c_str(), ImVec2(wl, bh), gSoft)) Go(S_ACC);
